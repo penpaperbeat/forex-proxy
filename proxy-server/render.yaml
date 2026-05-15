@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: forex-proxy-server
+    env: node
+    buildCommand: cd proxy-server && npm install
+    startCommand: cd proxy-server && npm start
+    envVars:
+      - key: TWELVEDATA_API_KEY
+        sync: false
+      - key: FOREX_PAIRS
+        value: "EUR/USD,GBP/USD,USD/JPY"
+      - key: PORT
+        value: "3000"

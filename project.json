@@ -1,0 +1,24 @@
+{
+  "overview": "A standalone Node.js proxy server that polls the Twelve Data REST API every 2 minutes for configurable forex currency pair rates, caches them in memory, and exposes clean REST endpoints. Ready to deploy on Render.com.",
+  "features": [
+    "Polls Twelve Data every 2 minutes for forex rates on configurable currency pairs",
+    "/rates endpoint returns all cached pair prices with timestamps",
+    "/health endpoint returns server status without triggering API calls",
+    "Graceful fallback to last cached prices when Twelve Data is unavailable",
+    "Console logging for every poll cycle",
+    "Configurable via TWELVEDATA_API_KEY and FOREX_PAIRS environment variables",
+    "CORS-enabled for cross-origin browser requests",
+    "Render.com deployment config included"
+  ],
+  "category": "backend-service",
+  "tags": [
+    "nodejs",
+    "forex",
+    "proxy",
+    "rest-api",
+    "twelve-data",
+    "render",
+    "caching"
+  ],
+  "last_updated": "2026-05-15T01:52:13.155Z"
+}
