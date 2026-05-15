@@ -1,24 +1,26 @@
 {
-  "overview": "A standalone Node.js proxy server that polls the Twelve Data REST API every 2 minutes for configurable forex currency pair rates, caches them in memory, and exposes clean REST endpoints. Ready to deploy on Render.com.",
+  "overview": "A standalone Node.js proxy server that polls the Twelve Data REST API every 2 minutes for forex rates, caches prices and historical OHLC data in memory, and exposes /rates, /history, and /health endpoints. Fully configured for one-click deployment on Render.com.",
   "features": [
-    "Polls Twelve Data every 2 minutes for forex rates on configurable currency pairs",
-    "/rates endpoint returns all cached pair prices with timestamps",
-    "/health endpoint returns server status without triggering API calls",
-    "Graceful fallback to last cached prices when Twelve Data is unavailable",
-    "Console logging for every poll cycle",
-    "Configurable via TWELVEDATA_API_KEY and FOREX_PAIRS environment variables",
-    "CORS-enabled for cross-origin browser requests",
-    "Render.com deployment config included"
+    "Polls Twelve Data for live forex rates every 2 minutes",
+    "Caches latest prices with timestamps in memory",
+    "Fetches 200-candle 1H OHLC history for all pairs at startup",
+    "/rates endpoint returns all cached pair prices",
+    "/history endpoint returns cached OHLC data without additional API calls",
+    "/health endpoint returns uptime without triggering any API call",
+    "Graceful fallback — serves last cached prices if Twelve Data is unavailable",
+    "Configurable forex pairs via FOREX_PAIRS environment variable",
+    "Render.com deployment-ready with render.yaml, npm install build, and dynamic PORT support"
   ],
-  "category": "backend-service",
+  "category": "backend-api",
   "tags": [
     "nodejs",
-    "forex",
     "proxy",
-    "rest-api",
+    "forex",
     "twelve-data",
     "render",
-    "caching"
+    "api",
+    "caching",
+    "express"
   ],
-  "last_updated": "2026-05-15T01:52:13.155Z"
+  "last_updated": "2026-05-15T22:45:02.935Z"
 }
