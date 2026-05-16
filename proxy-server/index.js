@@ -29,6 +29,23 @@ let ratesLastUpdated = null;
 let historyLastUpdated = null;
 const HISTORY_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
 const startTime = Date.now();
+function nextMidnightUTC() {
+  const now = new Date();
+  const midnight = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+  return midnight.getTime();
+}
+
+function incrementCallCount() {
+  if (Date.now() >= callCountResetAt) {
+    dailyCallCount = 0;
+    callCountResetAt = nextMidnightUTC();
+  }
+  dailyCallCount++;
+}
+
+let dailyCallCount = 0;
+let callCountResetAt = nextMidnightUTC();
+let lastCollectionError = null;
 
 async function fetchHistory() {
   console.log(`[${new Date().toISOString()}] Fetching historical OHLC data for ${PAIRS.length} pairs...`);
