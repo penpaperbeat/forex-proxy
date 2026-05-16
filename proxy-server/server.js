@@ -7,17 +7,20 @@ const fs = require('fs');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.TWELVEDATA_API_KEY;
+const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
 const FOREX_PAIRS = (process.env.FOREX_PAIRS || 'EUR/USD,GBP/USD,USD/JPY,USD/CHF,AUD/USD,USD/CAD,NZD/USD')
   .split(',')
   .map(p => p.trim());
 
 const CANDLE_STORE_PATH = '/tmp/candle-store.json';
 const CANDLE_CAP = 5000;
+const CALENDAR_CACHE_TTL = 60 * 60 * 1000; // 1 hour
 
 // --- In-memory state ---
 let ratesCache = { data: { pairs: {} }, fetchedAt: 0 };
 let historyCache = { data: { pairs: {} }, fetchedAt: 0 };
 let candleStore = { pairs: {} };
+let calendarCache = { data: [], fetchedAt: 0 };
 let dailyCallCount = 0;
 let callCountResetAt = nextMidnightUTC();
 let lastCollectionError = null;
@@ -124,9 +127,74 @@ async function runCollection() {
   }
 }
 
-// --- Startup: run immediately, then every 15 minutes ---
+// --- Fetch economic calendar from Finnhub ---
+async function fetchCalendar() {
+  const now = new Date();
+  const from = now.toISOString().split('T')[0];
+  const to = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+
+  const RELEVANT_CURRENCIES = ['USD', 'EUR', 'GBP', 'JPY', 'CHF', 'AUD', 'CAD', 'NZD'];
+
+  // Try Finnhub first
+  if (FINNHUB_API_KEY) {
+    try {
+      const response = await axios.get('https://finnhub.io/api/v1/calendar/economic', {
+        params: { from, to, token: FINNHUB_API_KEY }
+      });
+      const events = (response.data.economicCalendar || [])
+        .filter(e => {
+          const impact = (e.impact || '').toLowerCase();
+          const currency = (e.country || '').toUpperCase();
+          return impact === 'high' && RELEVANT_CURRENCIES.includes(currency);
+        })
+        .map(e => ({
+          time: e.time,
+          currency: e.country,
+          event: e.event,
+          impact: e.impact,
+          forecast: e.estimate || null,
+          previous: e.prev || null
+        }));
+      calendarCache = { data: events, fetchedAt: Date.now() };
+      console.log(`[${new Date().toISOString()}] Calendar fetched from Finnhub: ${events.length} high-impact events.`);
+      return;
+    } catch (err) {
+      console.error(`[${new Date().toISOString()}] Finnhub calendar fetch failed:`, err.message);
+    }
+  }
+
+  // Fallback: ForexFactory RSS
+  try {
+    const rssResponse = await axios.get('https://nfs.faireconomy.media/ff_calendar_thisweek.xml', {
+      timeout: 10000
+    });
+    const xml = rssResponse.data;
+    const events = [];
+    const itemRegex = /<item>([\s\S]*?)<\/item>/g;
+    let match;
+    while ((match = itemRegex.exec(xml)) !== null) {
+      const item = match[1];
+      const title = (item.match(/<title>(.*?)<\/title>/) || [])[1] || '';
+      const pubDate = (item.match(/<pubDate>(.*?)<\/pubDate>/) || [])[1] || '';
+      const impact = (item.match(/<impact>(.*?)<\/impact>/) || [])[1] || '';
+      const currency = (item.match(/<country>(.*?)<\/country>/) || [])[1] || '';
+      if (impact.toLowerCase() === 'high' && RELEVANT_CURRENCIES.includes(currency.toUpperCase())) {
+        events.push({ time: pubDate, currency: currency.toUpperCase(), event: title, impact: 'high', forecast: null, previous: null });
+      }
+    }
+    calendarCache = { data: events, fetchedAt: Date.now() };
+    console.log(`[${new Date().toISOString()}] Calendar fetched from ForexFactory RSS: ${events.length} high-impact events.`);
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] ForexFactory RSS fallback failed:`, err.message);
+  }
+}
+
+// --- Startup: run immediately, then on intervals ---
 runCollection();
 setInterval(runCollection, 15 * 60 * 1000);
+
+fetchCalendar();
+setInterval(fetchCalendar, CALENDAR_CACHE_TTL);
 
 // --- Routes ---
 
@@ -151,6 +219,15 @@ app.get('/stored-history', (req, res) => {
   return res.json(limited);
 });
 
+app.get('/calendar', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.json({
+    events: calendarCache.data,
+    fetchedAt: calendarCache.fetchedAt ? new Date(calendarCache.fetchedAt).toISOString() : null,
+    count: calendarCache.data.length
+  });
+});
+
 app.get('/status', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.json({
@@ -158,6 +235,8 @@ app.get('/status', (req, res) => {
     limit: 800,
     resetAt: new Date(callCountResetAt).toUTCString(),
     candlePairsStored: Object.keys(candleStore.pairs).length,
+    calendarEvents: calendarCache.data.length,
+    calendarFetchedAt: calendarCache.fetchedAt ? new Date(calendarCache.fetchedAt).toISOString() : null,
     lastCollectionError: lastCollectionError || null
   });
 });
@@ -168,7 +247,8 @@ app.get('/health', (req, res) => {
     status: 'ok',
     uptime: process.uptime(),
     ratesCachedAt: ratesCache.fetchedAt ? new Date(ratesCache.fetchedAt).toISOString() : null,
-    historyCachedAt: historyCache.fetchedAt ? new Date(historyCache.fetchedAt).toISOString() : null
+    historyCachedAt: historyCache.fetchedAt ? new Date(historyCache.fetchedAt).toISOString() : null,
+    calendarCachedAt: calendarCache.fetchedAt ? new Date(calendarCache.fetchedAt).toISOString() : null
   });
 });
 
