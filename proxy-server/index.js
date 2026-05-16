@@ -2,6 +2,7 @@
 
 const express = require('express');
 const axios = require('axios');
+const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -10,6 +11,17 @@ const PAIRS = (process.env.FOREX_PAIRS || 'EUR/USD,GBP/USD,USD/JPY,AUD/USD')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
+
+const CANDLE_STORE_PATH = '/tmp/candle-store.json';
+const CANDLE_PAIRS = ['EUR/USD', 'GBP/USD', 'USD/JPY', 'USD/CHF', 'AUD/USD', 'USD/CAD', 'NZD/USD'];
+let candleStore;
+try {
+  const raw = fs.readFileSync(CANDLE_STORE_PATH, 'utf8');
+  candleStore = JSON.parse(raw);
+  console.log(`[${new Date().toISOString()}] Loaded candle store from ${CANDLE_STORE_PATH}`);
+} catch (_) {
+  candleStore = { pairs: {} };
+}
 
 const ratesCache = {};
 const historyCache = {};
@@ -85,6 +97,11 @@ app.get('/history', async (req, res) => {
   res.json({ pairs: historyCache });
 });
 
+app.get('/stored-history', (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.json(candleStore);
+});
+
 app.get('/health', (req, res) => {
   const historyNextRefresh = historyLastUpdated
     ? new Date(new Date(historyLastUpdated).getTime() + HISTORY_TTL_MS).toISOString()
@@ -105,6 +122,35 @@ async function start() {
   app.listen(PORT, () => {
     console.log(`[${new Date().toISOString()}] Forex proxy server listening on port ${PORT} (rates poll: 15min, history TTL: 6h)`);
   });
+
+  setInterval(async () => {
+    console.log(`[${new Date().toISOString()}] Candle store refresh: fetching history for ${CANDLE_PAIRS.length} pairs...`);
+    for (const pair of CANDLE_PAIRS) {
+      try {
+        const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(pair)}&interval=1h&outputsize=200&apikey=${API_KEY}`;
+        const response = await axios.get(url, { timeout: 15000 });
+        if (!response.data || !response.data.values) {
+          console.error(`[${new Date().toISOString()}] Candle store: no values for ${pair}`);
+          continue;
+        }
+        const existing = candleStore.pairs[pair] || [];
+        const combined = [...existing, ...response.data.values];
+        const seen = new Map();
+        for (const candle of combined) {
+          seen.set(candle.datetime, candle);
+        }
+        let merged = Array.from(seen.values()).sort((a, b) => a.datetime < b.datetime ? -1 : a.datetime > b.datetime ? 1 : 0);
+        if (merged.length > 5000) {
+          merged = merged.slice(merged.length - 5000);
+        }
+        candleStore.pairs[pair] = merged;
+        fs.writeFileSync(CANDLE_STORE_PATH, JSON.stringify(candleStore));
+        console.log(`[${new Date().toISOString()}] Candle store updated for ${pair}: ${merged.length} candles`);
+      } catch (err) {
+        console.error(`[${new Date().toISOString()}] Candle store fetch failed for ${pair}:`, err.message);
+      }
+    }
+  }, 30 * 60 * 1000); // 30 minutes
 }
 
 start().catch(err => {
