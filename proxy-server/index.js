@@ -98,8 +98,21 @@ app.get('/history', async (req, res) => {
 });
 
 app.get('/stored-history', (req, res) => {
-  res.set('Access-Control-Allow-Origin', '*');
-  res.json(candleStore);
+  res.setHeader('Access-Control-Allow-Origin', '*');
+
+  const limit = req.query.limit ? parseInt(req.query.limit) : null;
+
+  if (!limit || isNaN(limit)) {
+    return res.json(candleStore);
+  }
+
+  const limited = { pairs: {} };
+  for (const pair of Object.keys(candleStore.pairs)) {
+    const candles = candleStore.pairs[pair];
+    limited.pairs[pair] = candles.slice(-limit);
+  }
+
+  return res.json(limited);
 });
 
 app.get('/health', (req, res) => {
