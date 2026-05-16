@@ -1,109 +1,178 @@
+'use strict';
+
 const express = require('express');
 const axios = require('axios');
-const cors = require('cors');
+const fs = require('fs');
 
-// --- Config ---
-const TWELVEDATA_API_KEY = process.env.TWELVEDATA_API_KEY;
-if (!TWELVEDATA_API_KEY) {
-  console.error('[ERROR] TWELVEDATA_API_KEY environment variable is required but not set.');
-  process.exit(1);
+const app = express();
+const PORT = process.env.PORT || 3000;
+const API_KEY = process.env.TWELVEDATA_API_KEY;
+const FOREX_PAIRS = (process.env.FOREX_PAIRS || 'EUR/USD,GBP/USD,USD/JPY,USD/CHF,AUD/USD,USD/CAD,NZD/USD')
+  .split(',')
+  .map(p => p.trim());
+
+const CANDLE_STORE_PATH = '/tmp/candle-store.json';
+const CANDLE_CAP = 5000;
+
+// --- In-memory state ---
+let ratesCache = { data: { pairs: {} }, fetchedAt: 0 };
+let historyCache = { data: { pairs: {} }, fetchedAt: 0 };
+let candleStore = { pairs: {} };
+let dailyCallCount = 0;
+let callCountResetAt = nextMidnightUTC();
+let lastCollectionError = null;
+
+function nextMidnightUTC() {
+  const now = new Date();
+  const midnight = new Date(Date.UTC(
+    now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1
+  ));
+  return midnight.getTime();
 }
 
-const FOREX_PAIRS_RAW = process.env.FOREX_PAIRS || 'EUR/USD,GBP/USD';
-const FOREX_PAIRS = FOREX_PAIRS_RAW.split(',').map(p => p.trim()).filter(Boolean);
-const PORT = process.env.PORT || 3000;
+function incrementCallCount() {
+  if (Date.now() >= callCountResetAt) {
+    dailyCallCount = 0;
+    callCountResetAt = nextMidnightUTC();
+  }
+  dailyCallCount++;
+}
 
-// --- In-memory cache ---
-const cache = {}; // { "EUR/USD": { price: 1.234, timestamp: "..." } }
-let lastPoll = null;
+// --- Load candle store from disk on startup ---
+try {
+  if (fs.existsSync(CANDLE_STORE_PATH)) {
+    const raw = fs.readFileSync(CANDLE_STORE_PATH, 'utf8');
+    candleStore = JSON.parse(raw);
+    console.log('Candle store loaded from disk.');
+  }
+} catch (err) {
+  console.error('Failed to load candle store from disk:', err.message);
+  candleStore = { pairs: {} };
+}
 
-// --- Poll function ---
-async function pollForexRates() {
-  const now = new Date().toISOString();
-  console.log(`[${now}] Poll cycle started for pairs: ${FOREX_PAIRS.join(', ')}`);
+// --- Collection function: rates + history, staggered, async, per-pair error-safe ---
+async function runCollection() {
+  console.log(`[${new Date().toISOString()}] Collection cycle starting...`);
 
-  const symbol = FOREX_PAIRS.join(',');
-  const url = `https://api.twelvedata.com/price?symbol=${encodeURIComponent(symbol)}&apikey=${TWELVEDATA_API_KEY}`;
-
-  try {
-    const response = await axios.get(url, { timeout: 10000 });
-
-    if (response.status !== 200) {
-      throw new Error(`Non-200 status: ${response.status}`);
-    }
-
-    const data = response.data;
-
-    if (FOREX_PAIRS.length === 1) {
-      // Single pair: { price: "1.234" }
-      const pair = FOREX_PAIRS[0];
-      if (data.price) {
-        cache[pair] = {
-          price: parseFloat(data.price),
-          timestamp: new Date().toISOString(),
+  // Fetch rates for each pair, staggered 2s apart
+  for (let i = 0; i < FOREX_PAIRS.length; i++) {
+    const pair = FOREX_PAIRS[i];
+    if (i > 0) await new Promise(r => setTimeout(r, 2000));
+    try {
+      const response = await axios.get('https://api.twelvedata.com/exchange_rate', {
+        params: { symbol: pair, apikey: API_KEY }
+      });
+      if (response.data && response.data.rate) {
+        ratesCache.data.pairs[pair] = {
+          price: String(response.data.rate),
+          fetchedAt: new Date().toISOString()
         };
-        console.log(`[${new Date().toISOString()}] Poll success: ${pair} = ${cache[pair].price}`);
-      } else {
-        throw new Error(`Unexpected response for ${pair}: ${JSON.stringify(data)}`);
+        ratesCache.fetchedAt = Date.now();
       }
-    } else {
-      // Multiple pairs: { "EUR/USD": { price: "1.234" }, ... }
-      let updated = 0;
-      for (const pair of FOREX_PAIRS) {
-        const pairData = data[pair];
-        if (pairData && pairData.price) {
-          cache[pair] = {
-            price: parseFloat(pairData.price),
-            timestamp: new Date().toISOString(),
-          };
-          updated++;
-        } else {
-          console.warn(`[${new Date().toISOString()}] No price data for ${pair} in response`);
-        }
-      }
-      console.log(`[${new Date().toISOString()}] Poll success: updated ${updated}/${FOREX_PAIRS.length} pairs`);
+      incrementCallCount();
+    } catch (err) {
+      lastCollectionError = `${pair} rates: ${err.message}`;
+      console.error(`[${new Date().toISOString()}] Rate fetch failed for ${pair}:`, err.message);
     }
+  }
 
-    lastPoll = new Date().toISOString();
+  // Pause before history fetches
+  await new Promise(r => setTimeout(r, 2000));
+
+  // Fetch history for each pair, staggered 2s apart
+  for (let i = 0; i < FOREX_PAIRS.length; i++) {
+    const pair = FOREX_PAIRS[i];
+    if (i > 0) await new Promise(r => setTimeout(r, 2000));
+    try {
+      const response = await axios.get('https://api.twelvedata.com/time_series', {
+        params: { symbol: pair, interval: '1h', outputsize: 5000, apikey: API_KEY }
+      });
+      const newCandles = (response.data.values || [])
+        .map(c => ({
+          datetime: c.datetime,
+          open: parseFloat(c.open),
+          high: parseFloat(c.high),
+          low: parseFloat(c.low),
+          close: parseFloat(c.close)
+        }))
+        .filter(c => !isNaN(c.open) && !isNaN(c.high) && !isNaN(c.low) && !isNaN(c.close));
+
+      if (!candleStore.pairs[pair]) candleStore.pairs[pair] = [];
+      const map = {};
+      for (const c of candleStore.pairs[pair]) map[c.datetime] = c;
+      for (const c of newCandles) map[c.datetime] = c;
+      let merged = Object.values(map).sort((a, b) => a.datetime < b.datetime ? -1 : 1);
+      if (merged.length > CANDLE_CAP) merged = merged.slice(-CANDLE_CAP);
+      candleStore.pairs[pair] = merged;
+      historyCache.data.pairs[pair] = merged;
+      historyCache.fetchedAt = Date.now();
+      incrementCallCount();
+    } catch (err) {
+      lastCollectionError = `${pair} history: ${err.message}`;
+      console.error(`[${new Date().toISOString()}] History fetch failed for ${pair}:`, err.message);
+    }
+  }
+
+  // Persist to disk
+  try {
+    fs.writeFileSync(CANDLE_STORE_PATH, JSON.stringify(candleStore), 'utf8');
+    lastCollectionError = null;
+    console.log(`[${new Date().toISOString()}] Collection complete. Daily calls: ${dailyCallCount}`);
   } catch (err) {
-    console.error(`[${new Date().toISOString()}] Poll failed: ${err.message}`);
-    console.error('Serving last cached values (if any).');
+    lastCollectionError = `File write failed: ${err.message}`;
+    console.error('Failed to write candle store to disk:', err.message);
   }
 }
 
-// --- Express app ---
-const app = express();
+// --- Startup: run immediately, then every 15 minutes ---
+runCollection();
+setInterval(runCollection, 15 * 60 * 1000);
 
-app.use(cors());
-app.use(express.json());
+// --- Routes ---
 
-// GET /rates
 app.get('/rates', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.json(ratesCache.data);
+});
+
+app.get('/history', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.json(historyCache.data);
+});
+
+app.get('/stored-history', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const limit = req.query.limit ? parseInt(req.query.limit) : null;
+  if (!limit || isNaN(limit)) return res.json(candleStore);
+  const limited = { pairs: {} };
+  for (const pair of Object.keys(candleStore.pairs)) {
+    limited.pairs[pair] = candleStore.pairs[pair].slice(-limit);
+  }
+  return res.json(limited);
+});
+
+app.get('/status', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
   res.json({
-    success: true,
-    data: cache,
-    cachedAt: lastPoll,
-    pairs: FOREX_PAIRS,
+    callsToday: dailyCallCount,
+    limit: 800,
+    resetAt: new Date(callCountResetAt).toUTCString(),
+    candlePairsStored: Object.keys(candleStore.pairs).length,
+    lastCollectionError: lastCollectionError || null
   });
 });
 
-// GET /health
 app.get('/health', (req, res) => {
-  const cachedPairs = Object.keys(cache).length;
+  res.setHeader('Access-Control-Allow-Origin', '*');
   res.json({
     status: 'ok',
     uptime: process.uptime(),
-    pairs: FOREX_PAIRS,
-    cachedPairs,
-    lastPoll,
+    ratesCachedAt: ratesCache.fetchedAt ? new Date(ratesCache.fetchedAt).toISOString() : null,
+    historyCachedAt: historyCache.fetchedAt ? new Date(historyCache.fetchedAt).toISOString() : null
   });
 });
 
-// --- Start ---
-app.listen(PORT, '0.0.0.0', async () => {
-  console.log(`Forex proxy server running on port ${PORT}`);
-  // Immediate first poll on startup
-  await pollForexRates();
-  // Schedule subsequent polls every 2 minutes
-  setInterval(pollForexRates, 120000);
+// --- Start server ---
+app.listen(PORT, () => {
+  console.log(`[${new Date().toISOString()}] Forex proxy running on port ${PORT}`);
 });
