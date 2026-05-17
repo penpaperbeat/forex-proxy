@@ -58,7 +58,6 @@ function incrementCallCount() {
 
 function cors(res) { res.setHeader('Access-Control-Allow-Origin', '*'); }
 
-// --- Timeout helper: rejects after ms ---
 function withTimeout(promise, ms, label) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`TIMEOUT after ${ms}ms: ${label}`)), ms);
@@ -104,9 +103,7 @@ async function restoreFromCanister() {
     try {
       const resp = await withTimeout(
         axios.post(`${CANISTER_HOST}/api/v1/query`, {
-          canisterId: CANISTER_ID,
-          method: 'getStoredCandles',
-          args: [pair]
+          canisterId: CANISTER_ID, method: 'getStoredCandles', args: [pair]
         }, { timeout: 15000 }),
         20000, `restoreFromCanister ${pair}`
       );
@@ -120,9 +117,7 @@ async function restoreFromCanister() {
         historyCache.data.pairs[pair] = candleStore.pairs[pair].slice(-5000);
         console.log(`[restore] ${pair}: restored ${candles.length} candles from canister.`);
       }
-    } catch (err) {
-      console.warn(`[restore] ${pair}: canister restore failed:`, err.message);
-    }
+    } catch (err) { console.warn(`[restore] ${pair}: canister restore failed:`, err.message); }
   }
   try { fs.writeFileSync(CANDLE_STORE_PATH, JSON.stringify(candleStore), 'utf8'); } catch (_) {}
   console.log('[restore] Canister restore complete.');
@@ -167,7 +162,6 @@ function calculateRSI(candles, period = 14) {
 // --- Live collection (Twelve Data) ---
 async function runCollection() {
   console.log(`[${new Date().toISOString()}] Collection cycle starting...`);
-
   for (let i = 0; i < FOREX_PAIRS.length; i++) {
     const pair = FOREX_PAIRS[i];
     if (i > 0) await new Promise(r => setTimeout(r, 2000));
@@ -224,7 +218,7 @@ async function runCollection() {
   }
 }
 
-// --- Calendar (Finnhub / ForexFactory fallback) ---
+// --- Calendar ---
 const CALENDAR_CACHE_TTL = 60 * 60 * 1000;
 const RELEVANT_CURRENCIES = ['USD', 'EUR', 'GBP', 'JPY', 'CHF', 'AUD', 'CAD', 'NZD'];
 
@@ -268,7 +262,7 @@ async function fetchCalendar() {
   } catch (err) { console.error('[calendar] ForexFactory RSS fallback failed:', err.message); }
 }
 
-// --- Massive.com backfill (with per-chunk hard timeout) ---
+// --- Massive.com backfill ---
 async function runMassiveBackfill() {
   backfillStatus = 'running';
   console.log('[backfill] Starting Massive.com backfill...');
@@ -295,10 +289,7 @@ async function runMassiveBackfill() {
       const chunkEnd = new Date(cursor);
       chunkEnd.setMonth(chunkEnd.getMonth() + 1);
       if (chunkEnd > toDate) chunkEnd.setTime(toDate.getTime());
-      chunks.push({
-        from: cursor.toISOString().split('T')[0],
-        to: chunkEnd.toISOString().split('T')[0]
-      });
+      chunks.push({ from: cursor.toISOString().split('T')[0], to: chunkEnd.toISOString().split('T')[0] });
       cursor = new Date(chunkEnd);
       cursor.setDate(cursor.getDate() + 1);
     }
@@ -329,7 +320,6 @@ async function runMassiveBackfill() {
         let kept = 0, prev = null, pages = 0;
 
         while (nextUrl && pages < 10) {
-          // *** FIX: hard 30s timeout per page fetch — stalled requests no longer hang forever ***
           const response = await withTimeout(
             axios.get(nextUrl, { params, timeout: 25000 }),
             30000, `backfill ${pair} ${chunk.from}→${chunk.to} page ${pages}`
@@ -343,8 +333,7 @@ async function runMassiveBackfill() {
             if (prev !== null && Math.abs(close - prev) / prev > 0.20) { prev = close; continue; }
             const dt = new Date(bar.t).toISOString().slice(0, 19).replace('T', ' ');
             pairCandles.push({ datetime: dt, open, high, low, close });
-            prev = close;
-            kept++;
+            prev = close; kept++;
           }
 
           nextUrl = response.data.next_url ? response.data.next_url : null;
@@ -353,18 +342,22 @@ async function runMassiveBackfill() {
         }
 
         console.log(`[backfill] ${pair} ${chunk.from}→${chunk.to}: ${kept} candles kept.`);
-        await new Promise(r => setTimeout(r, 300));
+        // *** FIX: 12 second delay between chunks to stay under rate limit ***
+        await new Promise(r => setTimeout(r, 12000));
 
       } catch (err) {
         chunksFailed++;
+        const isRateLimit = err.response && err.response.status === 429;
         const msg = err.response ? `HTTP ${err.response.status}: ${JSON.stringify(err.response.data)}` : err.message;
         console.error(`[backfill] ${pair} ${chunk.from}→${chunk.to} failed (attempt ${chunksFailed}):`, msg);
-        // Skip to next pair after 3 consecutive failures
         if (chunksFailed >= 3) {
           console.error(`[backfill] ${pair}: 3 consecutive failures, skipping to next pair.`);
           break;
         }
-        await new Promise(r => setTimeout(r, 3000));
+        // *** FIX: 30 second retry wait (was 3s) — gives rate limit time to reset ***
+        const retryWait = isRateLimit ? 60000 : 30000;
+        console.log(`[backfill] ${pair}: waiting ${retryWait / 1000}s before retry...`);
+        await new Promise(r => setTimeout(r, retryWait));
       }
     }
 
@@ -391,13 +384,13 @@ async function runMassiveBackfill() {
     console.log(`[backfill] ${pair}: complete. ${pairCandles.length} candles stored. Total so far: ${backfillTotalCandles}`);
     try { fs.writeFileSync(BACKFILL_PROGRESS_PATH, JSON.stringify(progress), 'utf8'); } catch (_) {}
 
-    await new Promise(r => setTimeout(r, 500));
+    // *** FIX: 15 second delay between pairs to stay under rate limit ***
+    await new Promise(r => setTimeout(r, 15000));
   }
 
   backfillStatus = FOREX_PAIRS.every(p => progress[p] === 'complete') ? 'complete' : 'partial';
   console.log(`[backfill] Done. Status: ${backfillStatus}. Total candles: ${backfillTotalCandles}`);
 
-  // Retry incomplete pairs once after full pass
   const incompletePairs = FOREX_PAIRS.filter(p => progress[p] !== 'complete');
   if (incompletePairs.length > 0) {
     console.log(`[backfill] Retrying ${incompletePairs.length} incomplete pairs in 60s...`);
@@ -623,8 +616,6 @@ app.get('/health', (req, res) => {
 // --- Start ---
 app.listen(PORT, async () => {
   console.log(`[${new Date().toISOString()}] ForexMind proxy running on port ${PORT}`);
-
-  // Ensure /data directory exists (Railway persistent volume)
   try { fs.mkdirSync('/data', { recursive: true }); } catch (_) {}
 
   await restoreFromCanister();
