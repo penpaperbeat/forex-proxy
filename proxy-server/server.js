@@ -36,6 +36,7 @@ let intelligenceProfile = null;
 let dailyCallCount = 0;
 let callCountResetAt = nextMidnightUTC();
 let lastCollectionError = null;
+let lastHistoryFetchAt = 0;
 let backfillStatus = 'pending';
 let backfillPairsComplete = 0;
 let backfillTotalCandles = 0;
@@ -119,6 +120,8 @@ function calculateRSI(candles, period = 14) {
 
 async function runCollection() {
   console.log(`[${new Date().toISOString()}] Collection cycle starting...`);
+
+  // --- Rates: every 15 minutes (7 calls per cycle) ---
   for (let i = 0; i < FOREX_PAIRS.length; i++) {
     const pair = FOREX_PAIRS[i];
     if (i > 0) await new Promise(r => setTimeout(r, 2000));
@@ -128,26 +131,33 @@ async function runCollection() {
       incrementCallCount();
     } catch (err) { lastCollectionError = `${pair} rates: ${err.message}`; console.error(`[collection] Rate fetch failed for ${pair}:`, err.message); }
   }
-  await new Promise(r => setTimeout(r, 2000));
-  for (let i = 0; i < FOREX_PAIRS.length; i++) {
-    const pair = FOREX_PAIRS[i];
-    if (i > 0) await new Promise(r => setTimeout(r, 2000));
-    try {
-      const response = await axios.get('https://api.twelvedata.com/time_series', { params: { symbol: pair, interval: '1h', outputsize: 5000, apikey: API_KEY }, timeout: 30000 });
-      const newCandles = (response.data.values || []).map(c => ({ datetime: c.datetime, open: parseFloat(c.open), high: parseFloat(c.high), low: parseFloat(c.low), close: parseFloat(c.close) })).filter(c => !isNaN(c.open) && !isNaN(c.close));
-      if (!candleStore.pairs[pair]) candleStore.pairs[pair] = [];
-      const map = {};
-      for (const c of candleStore.pairs[pair]) map[c.datetime] = c;
-      for (const c of newCandles) map[c.datetime] = c;
-      const merged = Object.values(map).sort((a, b) => a.datetime < b.datetime ? -1 : 1);
-      candleStore.pairs[pair] = merged;
-      historyCache.data.pairs[pair] = merged.slice(-5000);
-      historyCache.fetchedAt = Date.now();
-      incrementCallCount();
-    } catch (err) { lastCollectionError = `${pair} history: ${err.message}`; console.error(`[collection] History fetch failed for ${pair}:`, err.message); }
+  console.log(`[${new Date().toISOString()}] Rates collection complete. Daily calls: ${dailyCallCount}`);
+
+  // --- History: every 2 hours (7 calls per cycle) ---
+  const now = Date.now();
+  if (now - lastHistoryFetchAt >= 2 * 60 * 60 * 1000) {
+    lastHistoryFetchAt = now;
+    await new Promise(r => setTimeout(r, 2000));
+    for (let i = 0; i < FOREX_PAIRS.length; i++) {
+      const pair = FOREX_PAIRS[i];
+      if (i > 0) await new Promise(r => setTimeout(r, 2000));
+      try {
+        const response = await axios.get('https://api.twelvedata.com/time_series', { params: { symbol: pair, interval: '1h', outputsize: 5000, apikey: API_KEY }, timeout: 30000 });
+        const newCandles = (response.data.values || []).map(c => ({ datetime: c.datetime, open: parseFloat(c.open), high: parseFloat(c.high), low: parseFloat(c.low), close: parseFloat(c.close) })).filter(c => !isNaN(c.open) && !isNaN(c.close));
+        if (!candleStore.pairs[pair]) candleStore.pairs[pair] = [];
+        const map = {};
+        for (const c of candleStore.pairs[pair]) map[c.datetime] = c;
+        for (const c of newCandles) map[c.datetime] = c;
+        const merged = Object.values(map).sort((a, b) => a.datetime < b.datetime ? -1 : 1);
+        candleStore.pairs[pair] = merged;
+        historyCache.data.pairs[pair] = merged.slice(-5000);
+        historyCache.fetchedAt = Date.now();
+        incrementCallCount();
+      } catch (err) { lastCollectionError = `${pair} history: ${err.message}`; console.error(`[collection] History fetch failed for ${pair}:`, err.message); }
+    }
+    try { fs.writeFileSync(CANDLE_STORE_PATH, JSON.stringify(candleStore), 'utf8'); lastCollectionError = null; console.log(`[${new Date().toISOString()}] History collection complete. Daily calls: ${dailyCallCount}`); }
+    catch (err) { lastCollectionError = `File write failed: ${err.message}`; console.error('[collection] Failed to write candle store:', err.message); }
   }
-  try { fs.writeFileSync(CANDLE_STORE_PATH, JSON.stringify(candleStore), 'utf8'); lastCollectionError = null; console.log(`[${new Date().toISOString()}] Collection complete. Daily calls: ${dailyCallCount}`); }
-  catch (err) { lastCollectionError = `File write failed: ${err.message}`; console.error('[collection] Failed to write candle store:', err.message); }
 }
 
 const CALENDAR_CACHE_TTL = 60 * 60 * 1000;
@@ -231,15 +241,6 @@ async function runDukascopyBackfill() {
 
 function yieldLoop() { return new Promise(r => setImmediate(r)); }
 function percentile(sorted, p) { if (!sorted.length) return 0; return sorted[Math.floor((p / 100) * (sorted.length - 1))]; }
-function classifySession(datetime) {
-  const hour = parseInt(datetime.slice(11, 13), 10);
-  if (hour >= 12 && hour < 16) return 'londonNY';
-  if (hour >= 12 && hour < 17) return 'newYork';
-  if (hour >= 7 && hour < 12) return 'london';
-  if (hour >= 23 || hour < 7) return 'tokyo';
-  if (hour >= 21 && hour < 23) return 'sydney';
-  return null;
-}
 
 async function calculateIntelligenceProfile() {
   intelligenceStatus = 'calculating';
