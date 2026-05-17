@@ -25,8 +25,8 @@ const BID_TO_MID = {
 const CANDLE_STORE_PATH = '/tmp/candle-store.json';
 const BACKFILL_PROGRESS_PATH = '/tmp/backfill-progress.json';
 const INTELLIGENCE_PROFILE_PATH = '/tmp/intelligence-profile.json';
-const CALENDAR_CACHE_TTL = 60 * 60 * 1000; // 1 hour
-const INTELLIGENCE_RECALC_INTERVAL = 30 * 24 * 60 * 60 * 1000; // 30 days
+const CALENDAR_CACHE_TTL = 60 * 60 * 1000;
+const INTELLIGENCE_RECALC_INTERVAL = 30 * 24 * 60 * 60 * 1000;
 
 // --- In-memory state ---
 let ratesCache = { data: { pairs: {} }, fetchedAt: 0 };
@@ -60,6 +60,11 @@ function sleep(ms) {
 
 function yieldToEventLoop() {
   return new Promise(r => setImmediate(r));
+}
+
+function parseDatetime(datetime) {
+  const raw = datetime.replace(' ', 'T');
+  return new Date(raw.includes('Z') || raw.includes('+') ? raw : raw + 'Z');
 }
 
 // --- Load persisted state on startup ---
@@ -145,7 +150,7 @@ async function runCollection() {
       const map = {};
       for (const c of candleStore.pairs[pair]) map[c.datetime] = c;
       for (const c of newCandles) map[c.datetime] = c;
-      let merged = Object.values(map).sort((a, b) => a.datetime < b.datetime ? -1 : 1);
+      const merged = Object.values(map).sort((a, b) => a.datetime < b.datetime ? -1 : 1);
       candleStore.pairs[pair] = merged;
       historyCache.data.pairs[pair] = merged.slice(-5000);
       historyCache.fetchedAt = Date.now();
@@ -246,9 +251,8 @@ async function runDukascopyBackfill() {
 
     console.log(`[backfill] Starting ${pair}...`);
     const instrument = pair.replace('/', '').toLowerCase();
-    let pairCandles = candleStore.pairs[pair] ? [...candleStore.pairs[pair]] : [];
     const existingMap = {};
-    for (const c of pairCandles) existingMap[c.datetime] = c;
+    for (const c of (candleStore.pairs[pair] || [])) existingMap[c.datetime] = c;
 
     for (let yearsBack = 10; yearsBack >= 1; yearsBack--) {
       const yearStart = new Date(Date.UTC(now.getUTCFullYear() - yearsBack, 0, 1));
@@ -324,8 +328,6 @@ async function runDukascopyBackfill() {
 
   backfillStatus.status = 'complete';
   console.log(`[backfill] All pairs complete. Total candles: ${backfillStatus.totalCandles}`);
-
-  // Trigger intelligence profile calculation after backfill
   setImmediate(() => calculateIntelligenceProfile());
 }
 
@@ -335,6 +337,7 @@ async function calculateIntelligenceProfile() {
   intelligenceStatus = { status: 'calculating', pairsComplete: 0, pairsTotal: FOREX_PAIRS.length };
 
   const profile = {};
+  const now = new Date();
 
   for (const pair of FOREX_PAIRS) {
     const candles = candleStore.pairs[pair] || [];
@@ -350,26 +353,25 @@ async function calculateIntelligenceProfile() {
     // --- ATR percentile table ---
     const atrs = [];
     for (let i = 14; i < candles.length; i++) {
-      await (i % 500 === 0 ? yieldToEventLoop() : Promise.resolve());
-      const slice = candles.slice(i - 14, i + 1);
+      if (i % 500 === 0) await yieldToEventLoop();
       let atrSum = 0;
-      for (let j = 1; j < slice.length; j++) {
+      for (let j = i - 13; j <= i; j++) {
         const tr = Math.max(
-          slice[j].high - slice[j].low,
-          Math.abs(slice[j].high - slice[j - 1].close),
-          Math.abs(slice[j].low - slice[j - 1].close)
+          candles[j].high - candles[j].low,
+          Math.abs(candles[j].high - candles[j - 1].close),
+          Math.abs(candles[j].low - candles[j - 1].close)
         );
         atrSum += tr;
       }
       atrs.push(atrSum / 14);
     }
-    atrs.sort((a, b) => a - b);
+    const sortedAtrs = [...atrs].sort((a, b) => a - b);
     const pct = (arr, p) => arr[Math.floor(arr.length * p / 100)];
     const atrPercentiles = {
-      p25: pct(atrs, 25),
-      p50: pct(atrs, 50),
-      p75: pct(atrs, 75),
-      p95: pct(atrs, 95)
+      p25: pct(sortedAtrs, 25),
+      p50: pct(sortedAtrs, 50),
+      p75: pct(sortedAtrs, 75),
+      p95: pct(sortedAtrs, 95)
     };
 
     // --- Current volatility regime ---
@@ -429,21 +431,21 @@ async function calculateIntelligenceProfile() {
 
     // --- Session win rate matrix ---
     const sessions = {
-      tokyo:    { hours: [0, 1, 2, 3, 4, 5, 6, 7], wins: [], weightedWins: 0, weightedTotal: 0 },
-      london:   { hours: [7, 8, 9, 10, 11, 12, 13, 14, 15], wins: [], weightedWins: 0, weightedTotal: 0 },
-      newYork:  { hours: [13, 14, 15, 16, 17, 18, 19, 20], wins: [], weightedWins: 0, weightedTotal: 0 },
-      londonNY: { hours: [13, 14, 15, 16], wins: [], weightedWins: 0, weightedTotal: 0 },
-      sydney:   { hours: [21, 22, 23, 0], wins: [], weightedWins: 0, weightedTotal: 0 }
+      tokyo:    { hours: [0, 1, 2, 3, 4, 5, 6, 7], weightedWins: 0, weightedTotal: 0 },
+      london:   { hours: [7, 8, 9, 10, 11, 12, 13, 14, 15], weightedWins: 0, weightedTotal: 0 },
+      newYork:  { hours: [13, 14, 15, 16, 17, 18, 19, 20], weightedWins: 0, weightedTotal: 0 },
+      londonNY: { hours: [13, 14, 15, 16], weightedWins: 0, weightedTotal: 0 },
+      sydney:   { hours: [21, 22, 23, 0], weightedWins: 0, weightedTotal: 0 }
     };
 
-    const now = new Date();
     for (let i = 20; i < candles.length - 4; i++) {
-      await (i % 1000 === 0 ? yieldToEventLoop() : Promise.resolve());
+      if (i % 1000 === 0) await yieldToEventLoop();
       const c = candles[i];
-      const dt = new Date(c.datetime.replace(' ', 'T') + ':00Z');
+      const dt = parseDatetime(c.datetime);
+      if (isNaN(dt.getTime())) continue;
       const hour = dt.getUTCHours();
       const monthsAgo = (now.getFullYear() - dt.getFullYear()) * 12 + (now.getMonth() - dt.getMonth());
-      const weight = Math.pow(0.85, monthsAgo);
+      const weight = Math.pow(0.85, Math.max(0, monthsAgo));
       const atr = atrs[i - 14] || atrPercentiles.p50;
       const direction = c.close > c.open ? 1 : -1;
       let win = false;
@@ -452,7 +454,7 @@ async function calculateIntelligenceProfile() {
         if (direction === 1 && future.close - c.close >= atr) { win = true; break; }
         if (direction === -1 && c.close - future.close >= atr) { win = true; break; }
       }
-      for (const [sessionName, session] of Object.entries(sessions)) {
+      for (const session of Object.values(sessions)) {
         if (session.hours.includes(hour)) {
           session.weightedWins += win ? weight : 0;
           session.weightedTotal += weight;
@@ -475,16 +477,18 @@ async function calculateIntelligenceProfile() {
 
     await yieldToEventLoop();
 
-    // --- Seasonal bias ---
+    // --- Seasonal bias (fixed: proper datetime parsing + month guard) ---
     const monthBuckets = {};
     for (let m = 1; m <= 12; m++) monthBuckets[m] = { weightedSum: 0, weightedCount: 0 };
 
     for (let i = 1; i < candles.length; i++) {
-      await (i % 2000 === 0 ? yieldToEventLoop() : Promise.resolve());
-      const dt = new Date(candles[i].datetime.replace(' ', 'T') + ':00Z');
+      if (i % 2000 === 0) await yieldToEventLoop();
+      const dt = parseDatetime(candles[i].datetime);
+      if (isNaN(dt.getTime())) continue;
       const month = dt.getUTCMonth() + 1;
+      if (!month || month < 1 || month > 12) continue;
       const monthsAgo = (now.getFullYear() - dt.getFullYear()) * 12 + (now.getMonth() - dt.getMonth());
-      const weight = Math.pow(0.85, monthsAgo);
+      const weight = Math.pow(0.85, Math.max(0, monthsAgo));
       const followThrough = candles[i].close > candles[i - 1].close ? 1 : 0;
       monthBuckets[month].weightedSum += followThrough * weight;
       monthBuckets[month].weightedCount += weight;
@@ -494,7 +498,7 @@ async function calculateIntelligenceProfile() {
     const seasonalBias = {};
     for (let m = 1; m <= 12; m++) {
       const avg = monthBuckets[m].weightedCount > 0 ? monthBuckets[m].weightedSum / monthBuckets[m].weightedCount : 0.5;
-      seasonalBias[m] = Math.round((avg / baselineAvg) * 100) / 100;
+      seasonalBias[m] = Math.round((avg / (baselineAvg || 0.5)) * 100) / 100;
     }
 
     profile[pair] = {
@@ -555,21 +559,17 @@ function evaluateRSIThreshold(candles, oversold, overbought) {
 app.listen(PORT, () => {
   console.log(`[${new Date().toISOString()}] Forex proxy running on port ${PORT}`);
 
-  // Start Twelve Data collection immediately, then every 15 minutes
   runCollection();
   setInterval(runCollection, 15 * 60 * 1000);
 
-  // Start economic calendar fetch, then every hour
   fetchCalendar();
   setInterval(fetchCalendar, CALENDAR_CACHE_TTL);
 
-  // Start Dukascopy backfill in background after server is live
   setImmediate(() => {
     if (backfillStatus.status !== 'complete') {
       runDukascopyBackfill();
     } else {
       console.log('[startup] Backfill already complete.');
-      // Check if intelligence profile needs recalculation
       if (!intelligenceProfile) {
         setImmediate(() => calculateIntelligenceProfile());
       } else {
@@ -582,7 +582,6 @@ app.listen(PORT, () => {
     }
   });
 
-  // Recalculate intelligence profile every 30 days
   setInterval(() => {
     if (backfillStatus.status === 'complete') {
       console.log('[scheduler] Triggering scheduled intelligence profile recalculation.');
