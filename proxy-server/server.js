@@ -610,6 +610,10 @@ async function runSMCEvaluation() {
         dxyBias: currentDXYBias,
         obZone: trinity.obZone || null,
         fvgZone: trinity.fvgZone || null,
+        entry:      trinity.entry      || null,
+        stopLoss:   trinity.stopLoss   || null,
+        takeProfit: trinity.takeProfit || null,
+        atr:        trinity.atr        || null,
         ensembleScore: null, signalTypeKey, generatedAt: now.toISOString()
       };
 
