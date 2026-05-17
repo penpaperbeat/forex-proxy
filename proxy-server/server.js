@@ -566,8 +566,8 @@ app.listen(PORT, () => {
   setInterval(fetchCalendar, CALENDAR_CACHE_TTL);
 
   setImmediate(() => {
-    if (backfillStatus.status !== 'complete') {
-      runDukascopyBackfill();
+    if (backfillStatus.status !== 'complete' || backfillStatus.totalCandles === 0) {
+  runDukascopyBackfill();
     } else {
       console.log('[startup] Backfill already complete.');
       if (!intelligenceProfile) {
