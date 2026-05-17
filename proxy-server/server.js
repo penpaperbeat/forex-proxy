@@ -23,7 +23,7 @@ const BID_TO_MID = {
 };
 
 const CANDLE_STORE_PATH = '/tmp/candle-store.json';
-const BACKFILL_PROGRESS_PATH = '/tmp/backfill-progress-v2.json';
+const BACKFILL_PROGRESS_PATH = '/tmp/backfill-progress-v3.json';
 const INTELLIGENCE_PROFILE_PATH = '/tmp/intelligence-profile.json';
 const CALENDAR_CACHE_TTL = 60 * 60 * 1000;
 const INTELLIGENCE_RECALC_INTERVAL = 30 * 24 * 60 * 60 * 1000;
@@ -83,8 +83,16 @@ try {
     backfillProgress = JSON.parse(fs.readFileSync(BACKFILL_PROGRESS_PATH, 'utf8'));
     const completed = Object.keys(backfillProgress).filter(p => backfillProgress[p].complete).length;
     backfillStatus.pairsComplete = completed;
-    if (completed === FOREX_PAIRS.length) backfillStatus.status = 'complete';
-    console.log(`[startup] Backfill progress loaded: ${completed}/${FOREX_PAIRS.length} pairs complete.`);
+    // Populate totalCandles from checkpoint data
+    for (const pair of FOREX_PAIRS) {
+      if (backfillProgress[pair] && backfillProgress[pair].complete) {
+        backfillStatus.totalCandles += backfillProgress[pair].candles || 0;
+      }
+    }
+    if (completed === FOREX_PAIRS.length && backfillStatus.totalCandles > 0) {
+      backfillStatus.status = 'complete';
+    }
+    console.log(`[startup] Backfill progress loaded: ${completed}/${FOREX_PAIRS.length} pairs, ${backfillStatus.totalCandles} candles.`);
   }
 } catch (err) {
   console.error('[startup] Failed to load backfill progress:', err.message);
@@ -246,6 +254,7 @@ async function runDukascopyBackfill() {
     if (backfillProgress[pair] && backfillProgress[pair].complete) {
       console.log(`[backfill] ${pair} already complete, skipping.`);
       backfillStatus.pairsComplete++;
+      backfillStatus.totalCandles += backfillProgress[pair].candles || 0;
       continue;
     }
 
@@ -285,7 +294,7 @@ async function runDukascopyBackfill() {
 
           if (isNaN(open) || isNaN(high) || isNaN(low) || isNaN(close)) continue;
           if (prevClose !== null && Math.abs(close - prevClose) / prevClose > 0.20) {
-            console.warn(`[backfill] ${pair} outlier rejected at ${datetime}: close=${close}, prev=${prevClose}`);
+            console.warn(`[backfill] ${pair} outlier rejected at ${datetime}`);
             prevClose = close;
             continue;
           }
@@ -432,9 +441,9 @@ async function calculateIntelligenceProfile() {
     // --- Session win rate matrix ---
     const sessions = {
       tokyo:    { hours: [0, 1, 2, 3, 4, 5, 6, 7], weightedWins: 0, weightedTotal: 0 },
-      london:   { hours: [7, 8, 9, 10, 11, 12, 13, 14, 15], weightedWins: 0, weightedTotal: 0 },
+      london:   { hours: [8, 9, 10, 11, 12, 13, 14, 15], weightedWins: 0, weightedTotal: 0 },
       newYork:  { hours: [13, 14, 15, 16, 17, 18, 19, 20], weightedWins: 0, weightedTotal: 0 },
-      londonNY: { hours: [13, 14, 15, 16], weightedWins: 0, weightedTotal: 0 },
+      londonNY: { hours: [13, 14, 15, 16, 17], weightedWins: 0, weightedTotal: 0 },
       sydney:   { hours: [21, 22, 23, 0], weightedWins: 0, weightedTotal: 0 }
     };
 
@@ -477,7 +486,7 @@ async function calculateIntelligenceProfile() {
 
     await yieldToEventLoop();
 
-    // --- Seasonal bias (fixed: proper datetime parsing + month guard) ---
+    // --- Seasonal bias ---
     const monthBuckets = {};
     for (let m = 1; m <= 12; m++) monthBuckets[m] = { weightedSum: 0, weightedCount: 0 };
 
@@ -566,8 +575,9 @@ app.listen(PORT, () => {
   setInterval(fetchCalendar, CALENDAR_CACHE_TTL);
 
   setImmediate(() => {
-    if (backfillStatus.status !== 'complete' || backfillStatus.totalCandles === 0) {
-  runDukascopyBackfill();
+    if (backfillStatus.status !== 'complete') {
+      console.log('[startup] Backfill not complete, starting Dukascopy backfill...');
+      runDukascopyBackfill();
     } else {
       console.log('[startup] Backfill already complete.');
       if (!intelligenceProfile) {
