@@ -1,64 +1,208 @@
 'use strict';
 
-const { Worker } = require('worker_threads');
-const path = require('path');
+const fs = require('fs');
 
-const state = { modelTrained: false, lastTrainedAt: null, resolvedSignalCount: 0, trainingSampleCount: 0, oosAccuracy: null, worker: null, pendingScores: new Map(), scoreCounter: 0 };
-const RETRAIN_DAYS = 7, RETRAIN_NEW_SIGNALS = 50;
-let newResolvedSinceTrain = 0;
+const MODEL_PATH = '/data/ensemble-model.json';
+const MIN_TRAINING_SAMPLES = 100;
 
-function spawnWorker() {
-  const w = new Worker(path.join(__dirname, 'ensembleWorker.js'));
-  w.on('message', msg => {
-    if (msg.type === 'trained') { if (msg.error) { console.warn('[Ensemble] Training failed:', msg.error); state.modelTrained = false; } else { state.modelTrained = true; state.lastTrainedAt = new Date().toISOString(); state.oosAccuracy = msg.oosAccuracy; newResolvedSinceTrain = 0; console.log(`[Ensemble] Model trained. OOS accuracy: ${msg.oosAccuracy !== null ? msg.oosAccuracy + '%' : 'N/A'}`); } }
-    else if (msg.type === 'scored') { const pending = state.pendingScores.get(msg.id); if (pending) { state.pendingScores.delete(msg.id); pending.resolve(msg.score); } }
-  });
-  w.on('error', err => { console.error('[Ensemble] Worker error:', err.message); for (const [, p] of state.pendingScores) p.resolve(50); state.pendingScores.clear(); state.modelTrained = false; setTimeout(() => { state.worker = spawnWorker(); }, 5000); });
-  w.on('exit', code => { if (code !== 0) { for (const [, p] of state.pendingScores) p.resolve(50); state.pendingScores.clear(); setTimeout(() => { state.worker = spawnWorker(); }, 5000); } });
-  return w;
+// Internal state
+let modelWeights = null;        // trained logistic regression weights
+let modelFeatureNames = null;
+let trainingCount = 0;
+let isModelReady = false;
+let lastTrainedAt = null;
+let totalScored = 0;
+let totalPassThrough = 0;
+
+// FIX #15: Load persisted model on startup
+try {
+  if (fs.existsSync(MODEL_PATH)) {
+    const raw = fs.readFileSync(MODEL_PATH, 'utf8');
+    const saved = JSON.parse(raw);
+    modelWeights = saved.weights;
+    modelFeatureNames = saved.featureNames;
+    trainingCount = saved.trainingCount || 0;
+    lastTrainedAt = saved.trainedAt || null;
+    isModelReady = true;
+    console.log(`[ensemble] Model restored from disk. Trained on ${trainingCount} samples.`);
+  }
+} catch (err) {
+  console.warn('[ensemble] Could not load persisted model:', err.message);
 }
 
-function extractFeatures(signal, paperTypeStats) {
-  const hour = signal.generatedAt ? new Date(signal.generatedAt).getUTCHours() : 12;
-  const dow = signal.generatedAt ? new Date(signal.generatedAt).getUTCDay() : 2;
-  const weekday = Math.max(0, Math.min(4, dow === 0 ? 4 : dow - 1));
-  const dxyMap = { USD_STRONG: 1, NEUTRAL: 0, USD_WEAK: -1 };
-  const sessionQualityMap = { 'New York Open': 1.0, 'London Open': 0.8, 'London Close': 0.7, 'Asian Open': 0.5 };
-  const sessionQuality = signal.killzoneName ? (sessionQualityMap[signal.killzoneName] || 0.3) : 0.3;
-  let obDistancePips = 0;
-  if (signal.obZone && signal.obZone.low != null) { const obMid = (signal.obZone.low + signal.obZone.high) / 2; obDistancePips = Math.min(50, Math.abs((signal.entryPrice || 0) - obMid) / (obMid > 10 ? 0.01 : 0.0001)); }
-  let fvgSizePips = 0;
-  if (signal.fvgZone && signal.fvgZone.low != null) { const obMid = signal.obZone ? (signal.obZone.low + signal.obZone.high) / 2 : 1; fvgSizePips = Math.min(50, (signal.fvgZone.high - signal.fvgZone.low) / (obMid > 10 ? 0.01 : 0.0001)); }
-  const rsi = signal.rsi != null ? signal.rsi : signal.direction === 'BUY' ? Math.max(10, 35 - ((signal.confidence || 60) - 60) / 2) : signal.direction === 'SELL' ? Math.min(90, 65 + ((signal.confidence || 60) - 60) / 2) : 50;
-  let typeWinRate = 0.5;
-  if (paperTypeStats && signal.signalTypeKey != null) { const ts = paperTypeStats.get ? paperTypeStats.get(signal.signalTypeKey) : paperTypeStats[signal.signalTypeKey]; if (ts && ts.total >= 20) typeWinRate = ts.wins / ts.total; }
-  return [rsi, signal.macd != null ? Math.max(-1, Math.min(1, signal.macd)) : 0, signal.adx != null ? signal.adx : 25, Math.max(0, Math.min(1, ((signal.confidence || 60) - 60) / 40)), obDistancePips, fvgSizePips, 5, sessionQuality, dxyMap[signal.dxyBias] !== undefined ? dxyMap[signal.dxyBias] : 0, Math.sin(2 * Math.PI * hour / 24), Math.cos(2 * Math.PI * hour / 24), weekday, typeWinRate];
+/**
+ * Extract a fixed-length feature vector from a signal object.
+ * Returns an array of numbers. Unknown/null values become 0.
+ */
+function extractFeatures(signal, _candles) {
+  const dir = signal.direction === 'BUY' ? 1 : -1;
+  const confidence = (signal.confidence || 0) / 100;
+  const ob = signal.orderBlockPresent ? 1 : 0;
+  const fvg = signal.fvgPresent ? 1 : 0;
+  const sweep = signal.liquiditySweepPresent ? 1 : 0;
+  const kz = signal.killzoneActive ? 1 : 0;
+
+  // DXY alignment: +1 if signal aligns with DXY bias, -1 if opposed, 0 if neutral
+  let dxyAlign = 0;
+  const bias = signal.dxyBias || 'NEUTRAL';
+  if (bias === 'BULLISH') dxyAlign = dir === 1 ? -1 : 1;  // DXY bullish = USD strong = bad for EUR/GBP BUY
+  if (bias === 'BEARISH') dxyAlign = dir === 1 ? 1 : -1;
+
+  // Hour of day (0–23 normalised)
+  let hourNorm = 0;
+  if (signal.generatedAt) {
+    try { hourNorm = new Date(signal.generatedAt).getUTCHours() / 23; } catch (_) {}
+  }
+
+  // Trinity score: 0–3 patterns present
+  const trinityScore = (ob + fvg + sweep) / 3;
+
+  return [dir, confidence, ob, fvg, sweep, kz, dxyAlign, hourNorm, trinityScore];
 }
 
-function initEnsembleScorer(resolvedSignals) {
-  if (!resolvedSignals || resolvedSignals.length < 100) { console.log(`[Ensemble] Insufficient training data (${(resolvedSignals || []).length} signals). Scoring disabled.`); return; }
-  state.resolvedSignalCount = state.trainingSampleCount = resolvedSignals.length;
-  if (!state.worker) state.worker = spawnWorker();
-  state.worker.postMessage({ type: 'train', samples: resolvedSignals });
+const FEATURE_NAMES = ['direction', 'confidence', 'ob', 'fvg', 'sweep', 'killzone', 'dxyAlign', 'hourNorm', 'trinityScore'];
+
+/**
+ * Simple logistic regression trained with gradient descent.
+ * Good enough for the feature set we have; keeps zero dependencies.
+ */
+function sigmoid(z) {
+  return 1 / (1 + Math.exp(-z));
 }
 
-function scoreSignal(features) {
-  if (!state.modelTrained || !state.worker) return Promise.resolve(null);
-  return new Promise(resolve => {
-    const id = String(++state.scoreCounter);
-    const timeout = setTimeout(() => { state.pendingScores.delete(id); resolve(50); }, 5000);
-    state.pendingScores.set(id, { resolve: score => { clearTimeout(timeout); resolve(score); }, reject: () => { clearTimeout(timeout); resolve(50); } });
-    state.worker.postMessage({ type: 'score', id, features });
-  });
+function trainLogisticRegression(samples, iterations = 500, lr = 0.05) {
+  const n = samples[0].features.length;
+  let w = new Array(n).fill(0);
+  let b = 0;
+
+  for (let iter = 0; iter < iterations; iter++) {
+    let dw = new Array(n).fill(0);
+    let db = 0;
+
+    for (const { features, outcome } of samples) {
+      const z = features.reduce((sum, x, i) => sum + x * w[i], b);
+      const pred = sigmoid(z);
+      const err = pred - (outcome ? 1 : 0);
+      for (let i = 0; i < n; i++) dw[i] += err * features[i];
+      db += err;
+    }
+
+    const m = samples.length;
+    for (let i = 0; i < n; i++) w[i] -= (lr / m) * dw[i];
+    b -= (lr / m) * db;
+  }
+
+  return { weights: w, bias: b };
 }
 
-function retrainIfNeeded(resolvedSignals) {
-  if (!resolvedSignals || resolvedSignals.length < 100) return;
-  newResolvedSinceTrain++;
-  const daysSince = state.lastTrainedAt ? (Date.now() - new Date(state.lastTrainedAt).getTime()) / (1000 * 60 * 60 * 24) : Infinity;
-  if (daysSince >= RETRAIN_DAYS || newResolvedSinceTrain >= RETRAIN_NEW_SIGNALS) { if (!state.worker) state.worker = spawnWorker(); state.trainingSampleCount = resolvedSignals.length; state.worker.postMessage({ type: 'retrain', samples: resolvedSignals }); }
+/**
+ * Train (or retrain) the ensemble scorer on resolved signal data.
+ * @param {Array<{features: number[], outcome: boolean}>} trainingData
+ */
+function initEnsembleScorer(trainingData) {
+  if (!trainingData || trainingData.length < MIN_TRAINING_SAMPLES) {
+    console.log(`[ensemble] Not enough samples to train (${(trainingData || []).length}/${MIN_TRAINING_SAMPLES}). Model stays as-is.`);
+    return;
+  }
+
+  // Filter out any malformed samples
+  const valid = trainingData.filter(d =>
+    Array.isArray(d.features) &&
+    d.features.length === FEATURE_NAMES.length &&
+    d.features.every(v => typeof v === 'number' && isFinite(v)) &&
+    typeof d.outcome === 'boolean'
+  );
+
+  if (valid.length < MIN_TRAINING_SAMPLES) {
+    console.warn(`[ensemble] Only ${valid.length} valid samples after filtering. Skipping train.`);
+    return;
+  }
+
+  try {
+    console.log(`[ensemble] Training on ${valid.length} samples...`);
+    const result = trainLogisticRegression(valid);
+    modelWeights = result.weights;
+    modelFeatureNames = FEATURE_NAMES;
+    trainingCount = valid.length;
+    isModelReady = true;
+    lastTrainedAt = new Date().toISOString();
+
+    // FIX #15: persist model to disk
+    try {
+      fs.writeFileSync(MODEL_PATH, JSON.stringify({
+        weights: modelWeights,
+        bias: result.bias,
+        featureNames: FEATURE_NAMES,
+        trainingCount,
+        trainedAt: lastTrainedAt
+      }), 'utf8');
+      console.log(`[ensemble] Model saved to disk.`);
+    } catch (writeErr) {
+      console.warn('[ensemble] Could not persist model:', writeErr.message);
+    }
+
+    console.log(`[ensemble] Training complete. Weights: ${modelWeights.map((w, i) => `${FEATURE_NAMES[i]}=${w.toFixed(3)}`).join(', ')}`);
+  } catch (trainErr) {
+    // FIX #13: surface training errors
+    console.error('[ensemble] Training failed:', trainErr.message);
+  }
 }
 
-function getEnsembleStatus() { return { modelTrained: state.modelTrained, lastTrainedAt: state.lastTrainedAt, resolvedSignalCount: state.resolvedSignalCount, trainingSampleCount: state.trainingSampleCount, oosAccuracy: state.oosAccuracy }; }
+// Load bias from persisted model (needed after restart)
+let modelBias = 0;
+try {
+  if (fs.existsSync(MODEL_PATH)) {
+    const saved = JSON.parse(fs.readFileSync(MODEL_PATH, 'utf8'));
+    modelBias = saved.bias || 0;
+  }
+} catch (_) {}
 
-module.exports = { initEnsembleScorer, scoreSignal, retrainIfNeeded, extractFeatures, getEnsembleStatus };
+/**
+ * Score a signal's feature vector. Returns 0–100 or null.
+ * FIX #13: errors are caught and logged, not silently swallowed.
+ * FIX #14: pass-through score returned when model not ready.
+ */
+async function scoreSignal(features) {
+  totalScored++;
+
+  // FIX #14: graceful degradation — return confidence-based pass-through when model not ready
+  if (!isModelReady || !modelWeights) {
+    totalPassThrough++;
+    // Return a basic score derived from features (trinityScore * confidence * 100)
+    const trinity = features[8] || 0;
+    const confidence = features[1] || 0;
+    return Math.round((trinity * 0.4 + confidence * 0.6) * 100);
+  }
+
+  try {
+    const z = features.reduce((sum, x, i) => sum + x * (modelWeights[i] || 0), modelBias);
+    const prob = sigmoid(z);
+    return Math.round(prob * 100);
+  } catch (err) {
+    // FIX #13: log scoring errors
+    console.warn('[ensemble] scoreSignal error:', err.message);
+    return null;
+  }
+}
+
+/**
+ * Returns current ensemble model status for the /ensemble-status endpoint.
+ */
+function getEnsembleStatus() {
+  return {
+    ready: isModelReady,
+    trainingCount,
+    lastTrainedAt,
+    totalScored,
+    totalPassThrough,
+    featureNames: FEATURE_NAMES,
+    modelWeights: isModelReady ? modelWeights : null
+  };
+}
+
+module.exports = {
+  extractFeatures,
+  initEnsembleScorer,
+  scoreSignal,
+  getEnsembleStatus
+};
