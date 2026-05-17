@@ -8,3 +8,13 @@
     "startCommand": "node server.js"
   }
 }
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "build": {
+    "builder": "NIXPACKS",
+    "buildCommand": "npm install --no-cache"
+  },
+  "deploy": {
+    "startCommand": "node server.js"
+  }
+}
