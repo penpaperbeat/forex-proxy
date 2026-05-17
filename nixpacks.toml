@@ -2,7 +2,7 @@
 nixPkgs = ["nodejs_20"]
 
 [phases.install]
-cmds = ["rm -rf node_modules/express node_modules/axios node_modules/.package-lock.json package-lock.json", "npm install --legacy-peer-deps"]
+cmds = ["cd proxy-server && npm install --legacy-peer-deps"]
 
 [start]
-cmd = "node server.js"
+cmd = "node proxy-server/server.js"
