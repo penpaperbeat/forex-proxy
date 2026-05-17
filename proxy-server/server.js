@@ -8,9 +8,12 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const smcEngine = require('./smcEngine');
 const ensembleScorer = require('./ensembleScorer');
+
 const API_KEY = process.env.TWELVEDATA_API_KEY;
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
-const MASSIVE_API_KEY = process.env.MASSIVE_API_KEY || 'xp_ShaA0JDicT0ntLGbgH3pMoj7G52Tf';
+const MASSIVE_API_KEY = process.env.MASSIVE_API_KEY || '';
+const PROXY_SECRET = process.env.PROXY_SECRET || '';
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 
 const FOREX_PAIRS = (process.env.FOREX_PAIRS || 'EUR/USD,GBP/USD,USD/JPY,USD/CHF,AUD/USD,USD/CAD,NZD/USD')
   .split(',').map(p => p.trim());
@@ -23,6 +26,7 @@ const MASSIVE_TICKER_MAP = {
 const CANDLE_STORE_PATH = '/data/candle-store.json';
 const BACKFILL_PROGRESS_PATH = '/data/backfill-progress.json';
 const INTELLIGENCE_PROFILE_PATH = '/data/intelligence-profile.json';
+const RESOLVED_SIGNALS_PATH = '/data/resolved-signals.json';
 
 let ratesCache = { data: { pairs: {} }, fetchedAt: 0 };
 let historyCache = { data: { pairs: {} }, fetchedAt: 0 };
@@ -56,7 +60,22 @@ function incrementCallCount() {
   dailyCallCount++;
 }
 
-function cors(res) { res.setHeader('Access-Control-Allow-Origin', '*'); }
+// FIX #7: CORS locked to configured origin
+function cors(res) {
+  res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
+  res.setHeader('Vary', 'Origin');
+}
+
+// FIX #6: Auth check for sensitive endpoints
+function requireAuth(req, res) {
+  if (!PROXY_SECRET) return true; // auth disabled if no secret set
+  const key = req.headers['x-forexmind-key'];
+  if (key !== PROXY_SECRET) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return false;
+  }
+  return true;
+}
 
 function withTimeout(promise, ms, label) {
   return new Promise((resolve, reject) => {
@@ -71,11 +90,10 @@ try {
   if (fs.existsSync(CANDLE_STORE_PATH)) {
     const raw = fs.readFileSync(CANDLE_STORE_PATH, 'utf8');
     candleStore = JSON.parse(raw);
-    historyCache.data = { pairs: {} };
     for (const pair of Object.keys(candleStore.pairs)) {
       historyCache.data.pairs[pair] = candleStore.pairs[pair].slice(-5000);
     }
-    console.log(`[startup] Candle store loaded from disk (${Object.keys(candleStore.pairs).length} pairs).`);
+    console.log(`[startup] Candle store loaded (${Object.keys(candleStore.pairs).length} pairs).`);
   }
 } catch (err) { console.error('[startup] Failed to load candle store:', err.message); candleStore = { pairs: {} }; }
 
@@ -86,19 +104,28 @@ try {
     intelligenceProfile = JSON.parse(raw);
     intelligenceStatus = 'active';
     intelligenceLastCalculated = intelligenceProfile._calculatedAt || null;
-    console.log('[startup] Intelligence profile loaded from disk.');
+    console.log('[startup] Intelligence profile loaded.');
   }
-} catch (err) { console.error('[startup] Failed to load intelligence profile:', err.message); intelligenceProfile = null; }
+} catch (err) { console.error('[startup] Failed to load intelligence profile:', err.message); }
+
+// FIX #5: Load resolved signals from disk on startup
+try {
+  if (fs.existsSync(RESOLVED_SIGNALS_PATH)) {
+    const raw = fs.readFileSync(RESOLVED_SIGNALS_PATH, 'utf8');
+    resolvedSignalsBuffer = JSON.parse(raw);
+    console.log(`[startup] Loaded ${resolvedSignalsBuffer.length} resolved signals.`);
+  }
+} catch (err) { console.error('[startup] Failed to load resolved signals:', err.message); }
 
 // --- Restore candle store from canister on startup ---
 async function restoreFromCanister() {
   const CANISTER_HOST = process.env.CANISTER_HOST || null;
   const CANISTER_ID = process.env.CANISTER_ID || null;
   if (!CANISTER_HOST || !CANISTER_ID) {
-    console.log('[restore] CANISTER_HOST or CANISTER_ID not set. Skipping canister restore.');
+    console.log('[restore] CANISTER_HOST or CANISTER_ID not set. Skipping.');
     return;
   }
-  console.log('[restore] Restoring candle store from canister...');
+  console.log('[restore] Restoring from canister...');
   for (const pair of FOREX_PAIRS) {
     try {
       const resp = await withTimeout(
@@ -115,12 +142,11 @@ async function restoreFromCanister() {
         for (const c of candles) map[c.datetime] = c;
         candleStore.pairs[pair] = Object.values(map).sort((a, b) => a.datetime < b.datetime ? -1 : 1);
         historyCache.data.pairs[pair] = candleStore.pairs[pair].slice(-5000);
-        console.log(`[restore] ${pair}: restored ${candles.length} candles from canister.`);
       }
-    } catch (err) { console.warn(`[restore] ${pair}: canister restore failed:`, err.message); }
+    } catch (err) { console.warn(`[restore] ${pair}: failed:`, err.message); }
   }
   try { fs.writeFileSync(CANDLE_STORE_PATH, JSON.stringify(candleStore), 'utf8'); } catch (_) {}
-  console.log('[restore] Canister restore complete.');
+  console.log('[restore] Complete.');
 }
 
 // --- ATR ---
@@ -159,6 +185,58 @@ function calculateRSI(candles, period = 14) {
   return rsi;
 }
 
+// FIX #5: Resolve signals older than 24 candles and record outcome
+function resolveOldSignals() {
+  const now = Date.now();
+  const RESOLUTION_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 hours
+  const stillPending = [];
+
+  for (const signal of paperSignalsBuffer) {
+    if (!signal.generatedAt) { stillPending.push(signal); continue; }
+    const age = now - new Date(signal.generatedAt).getTime();
+    if (age < RESOLUTION_WINDOW_MS) { stillPending.push(signal); continue; }
+
+    // Resolve: check if price moved in signal direction
+    const candles = candleStore.pairs[signal.pair];
+    if (!candles || candles.length < 2) { stillPending.push(signal); continue; }
+
+    const signalTime = new Date(signal.generatedAt).getTime();
+    const entryIdx = candles.findIndex(c => new Date(c.datetime).getTime() >= signalTime);
+    if (entryIdx < 0 || entryIdx + 24 >= candles.length) { stillPending.push(signal); continue; }
+
+    const entry = candles[entryIdx].close;
+    const future = candles.slice(entryIdx + 1, entryIdx + 25);
+    const atrVals = calculateATR(candles.slice(Math.max(0, entryIdx - 14), entryIdx + 1), 14);
+    const atr = atrVals.length ? atrVals[atrVals.length - 1] : entry * 0.001;
+
+    let outcome = 'Loss';
+    if (signal.direction === 'BUY' && future.some(c => c.high >= entry + atr)) outcome = 'Win';
+    if (signal.direction === 'SELL' && future.some(c => c.low <= entry - atr)) outcome = 'Win';
+
+    const resolved = { ...signal, outcome, resolvedAt: new Date().toISOString() };
+    resolvedSignalsBuffer.push(resolved);
+    newResolvedSinceRetrain++;
+  }
+
+  paperSignalsBuffer = stillPending;
+
+  // Persist resolved signals
+  if (newResolvedSinceRetrain > 0) {
+    try { fs.writeFileSync(RESOLVED_SIGNALS_PATH, JSON.stringify(resolvedSignalsBuffer.slice(-2000)), 'utf8'); } catch (_) {}
+  }
+
+  // Retrain ensemble when 50+ new resolved signals accumulate
+  if (newResolvedSinceRetrain >= 50 && resolvedSignalsBuffer.length >= 100) {
+    console.log(`[ensemble] Retraining on ${resolvedSignalsBuffer.length} resolved signals...`);
+    const trainingData = resolvedSignalsBuffer.map(s => ({
+      features: ensembleScorer.extractFeatures(s, null),
+      outcome: s.outcome === 'Win'
+    }));
+    ensembleScorer.initEnsembleScorer(trainingData);
+    newResolvedSinceRetrain = 0;
+  }
+}
+
 // --- Live collection (Twelve Data) ---
 async function runCollection() {
   console.log(`[${new Date().toISOString()}] Collection cycle starting...`);
@@ -179,7 +257,6 @@ async function runCollection() {
       incrementCallCount();
     } catch (err) { lastCollectionError = `${pair} rates: ${err.message}`; console.error(`[collection] Rate fetch failed for ${pair}:`, err.message); }
   }
-  console.log(`[${new Date().toISOString()}] Rates collection complete. Daily calls: ${dailyCallCount}`);
 
   const now = Date.now();
   if (now - lastHistoryFetchAt >= 2 * 60 * 60 * 1000) {
@@ -203,9 +280,8 @@ async function runCollection() {
         const map = {};
         for (const c of candleStore.pairs[pair]) map[c.datetime] = c;
         for (const c of newCandles) map[c.datetime] = c;
-        const merged = Object.values(map).sort((a, b) => a.datetime < b.datetime ? -1 : 1);
-        candleStore.pairs[pair] = merged;
-        historyCache.data.pairs[pair] = merged.slice(-5000);
+        candleStore.pairs[pair] = Object.values(map).sort((a, b) => a.datetime < b.datetime ? -1 : 1);
+        historyCache.data.pairs[pair] = candleStore.pairs[pair].slice(-5000);
         historyCache.fetchedAt = Date.now();
         incrementCallCount();
       } catch (err) { lastCollectionError = `${pair} history: ${err.message}`; console.error(`[collection] History fetch failed for ${pair}:`, err.message); }
@@ -213,9 +289,11 @@ async function runCollection() {
     try {
       fs.writeFileSync(CANDLE_STORE_PATH, JSON.stringify(candleStore), 'utf8');
       lastCollectionError = null;
-      console.log(`[${new Date().toISOString()}] History collection complete. Daily calls: ${dailyCallCount}`);
-    } catch (err) { lastCollectionError = `File write failed: ${err.message}`; console.error('[collection] Failed to write candle store:', err.message); }
+    } catch (err) { lastCollectionError = `File write failed: ${err.message}`; }
   }
+
+  // FIX #5: resolve old signals on each cycle
+  resolveOldSignals();
 }
 
 // --- Calendar ---
@@ -226,6 +304,7 @@ async function fetchCalendar() {
   const now = new Date();
   const from = now.toISOString().split('T')[0];
   const to = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+
   if (FINNHUB_API_KEY) {
     try {
       const response = await withTimeout(
@@ -238,169 +317,202 @@ async function fetchCalendar() {
         .filter(e => (e.impact || '').toLowerCase() === 'high' && RELEVANT_CURRENCIES.includes((e.country || '').toUpperCase()))
         .map(e => ({ time: e.time, currency: e.country, event: e.event, impact: e.impact, forecast: e.estimate || null, previous: e.prev || null }));
       calendarCache = { data: events, fetchedAt: Date.now() };
-      console.log(`[calendar] Finnhub: ${events.length} high-impact events.`); return;
-    } catch (err) { console.error('[calendar] Finnhub fetch failed:', err.message); }
+      console.log(`[calendar] Finnhub: ${events.length} high-impact events.`);
+      return;
+    } catch (err) { console.error('[calendar] Finnhub failed:', err.message); }
   }
+
+  // FIX #8: ForexFactory RSS regex corrected to match real format
   try {
     const rssResponse = await withTimeout(
       axios.get('https://nfs.faireconomy.media/ff_calendar_thisweek.xml', { timeout: 10000 }),
       15000, 'fetchCalendar forexfactory'
     );
-    const xml = rssResponse.data, events = [];
-    const itemRe = /<item>([\s\S]*?)<\/item>/g; let match;
+    const xml = rssResponse.data;
+    const events = [];
+    const itemRe = /<event>([\s\S]*?)<\/event>/g;
+    let match;
     while ((match = itemRe.exec(xml)) !== null) {
       const item = match[1];
-      const title = (item.match(/<title>(.*?)<\/title>/) || [])[1] || '';
-      const pubDate = (item.match(/<pubDate>(.*?)<\/pubDate>/) || [])[1] || '';
-      const impact = (item.match(/<impact>(.*?)<\/impact>/) || [])[1] || '';
-      const currency = (item.match(/<country>(.*?)<\/country>/) || [])[1] || '';
-      if (impact.toLowerCase() === 'high' && RELEVANT_CURRENCIES.includes(currency.toUpperCase()))
-        events.push({ time: pubDate, currency: currency.toUpperCase(), event: title, impact: 'high', forecast: null, previous: null });
+      const titleMatch = item.match(/<title><!\[CDATA\[(.*?)\]\]><\/title>/) || item.match(/<title>(.*?)<\/title>/);
+      const dateMatch = item.match(/<date>(.*?)<\/date>/);
+      const timeMatch = item.match(/<time>(.*?)<\/time>/);
+      const impactMatch = item.match(/<impact>(.*?)<\/impact>/);
+      const currencyMatch = item.match(/<country>(.*?)<\/country>/);
+      const title = titleMatch ? titleMatch[1].trim() : '';
+      const impact = impactMatch ? impactMatch[1].trim() : '';
+      const currency = currencyMatch ? currencyMatch[1].trim().toUpperCase() : '';
+      const date = dateMatch ? dateMatch[1].trim() : '';
+      const time = timeMatch ? timeMatch[1].trim() : '';
+      if (impact === 'High' && RELEVANT_CURRENCIES.includes(currency)) {
+        events.push({ time: `${date} ${time}`.trim(), currency, event: title, impact: 'high', forecast: null, previous: null });
+      }
     }
     calendarCache = { data: events, fetchedAt: Date.now() };
     console.log(`[calendar] ForexFactory RSS: ${events.length} high-impact events.`);
   } catch (err) { console.error('[calendar] ForexFactory RSS fallback failed:', err.message); }
 }
 
-// --- Massive.com backfill ---
+// --- Massive.com backfill (FIX #2: iterative not recursive, FIX #1: counter fix, FIX #4: chunksFailed reset per pair) ---
 async function runMassiveBackfill() {
-  backfillStatus = 'running';
-  console.log('[backfill] Starting Massive.com backfill...');
+  let remainingPairs = [...FOREX_PAIRS];
+  let pass = 0;
+  const MAX_PASSES = 3;
 
-  let progress = {};
-  try {
-    if (fs.existsSync(BACKFILL_PROGRESS_PATH)) {
-      progress = JSON.parse(fs.readFileSync(BACKFILL_PROGRESS_PATH, 'utf8'));
-    }
-  } catch (_) {}
+  while (remainingPairs.length > 0 && pass < MAX_PASSES) {
+    pass++;
+    console.log(`[backfill] Pass ${pass}. Pairs remaining: ${remainingPairs.join(', ')}`);
+    backfillStatus = 'running';
 
-  for (const pair of FOREX_PAIRS) {
-    if (progress[pair] === 'incomplete') delete progress[pair];
-  }
+    let progress = {};
+    try {
+      if (fs.existsSync(BACKFILL_PROGRESS_PATH)) {
+        progress = JSON.parse(fs.readFileSync(BACKFILL_PROGRESS_PATH, 'utf8'));
+      }
+    } catch (_) {}
 
-  const now = new Date();
-  const twoYearsAgo = new Date(now);
-  twoYearsAgo.setFullYear(twoYearsAgo.getFullYear() - 2);
+    const now = new Date();
+    const twoYearsAgo = new Date(now);
+    twoYearsAgo.setFullYear(twoYearsAgo.getFullYear() - 2);
 
-  function buildChunks(fromDate, toDate) {
-    const chunks = [];
-    let cursor = new Date(fromDate);
-    while (cursor < toDate) {
-      const chunkEnd = new Date(cursor);
-      chunkEnd.setMonth(chunkEnd.getMonth() + 1);
-      if (chunkEnd > toDate) chunkEnd.setTime(toDate.getTime());
-      chunks.push({ from: cursor.toISOString().split('T')[0], to: chunkEnd.toISOString().split('T')[0] });
-      cursor = new Date(chunkEnd);
-      cursor.setDate(cursor.getDate() + 1);
-    }
-    return chunks;
-  }
-
-  const chunks = buildChunks(twoYearsAgo, now);
-  console.log(`[backfill] Date range: ${twoYearsAgo.toISOString().split('T')[0]} → ${now.toISOString().split('T')[0]} (${chunks.length} chunks per pair)`);
-
-  for (const pair of FOREX_PAIRS) {
-    if (progress[pair] === 'complete') {
-      backfillPairsComplete++;
-      console.log(`[backfill] ${pair}: already complete, skipping.`);
-      continue;
+    function buildChunks(fromDate, toDate) {
+      const chunks = [];
+      let cursor = new Date(fromDate);
+      while (cursor < toDate) {
+        const chunkEnd = new Date(cursor);
+        chunkEnd.setMonth(chunkEnd.getMonth() + 1);
+        if (chunkEnd > toDate) chunkEnd.setTime(toDate.getTime());
+        chunks.push({ from: cursor.toISOString().split('T')[0], to: chunkEnd.toISOString().split('T')[0] });
+        cursor = new Date(chunkEnd);
+        cursor.setDate(cursor.getDate() + 1);
+      }
+      return chunks;
     }
 
-    const ticker = MASSIVE_TICKER_MAP[pair];
-    if (!ticker) { console.warn(`[backfill] ${pair}: no ticker mapping, skipping.`); continue; }
+    const chunks = buildChunks(twoYearsAgo, now);
+    const incompleteThisPass = [];
 
-    console.log(`[backfill] Starting ${pair} (ticker: ${ticker})...`);
-    let pairCandles = [], chunksFailed = 0;
+    for (const pair of remainingPairs) {
+      if (progress[pair] === 'complete') {
+        // FIX #1: count candles from already-complete pairs toward total
+        if (!backfillPairsComplete || pass === 1) {
+          backfillPairsComplete++;
+          backfillTotalCandles += (candleStore.pairs[pair] || []).length;
+        }
+        continue;
+      }
 
-    for (const chunk of chunks) {
-      await new Promise(r => setImmediate(r));
-      try {
-        let nextUrl = `https://api.massive.com/v2/aggs/ticker/${ticker}/range/1/hour/${chunk.from}/${chunk.to}`;
-        let params = { adjusted: false, sort: 'asc', limit: 50000, apiKey: MASSIVE_API_KEY };
-        let kept = 0, prev = null, pages = 0;
+      const ticker = MASSIVE_TICKER_MAP[pair];
+      if (!ticker) { console.warn(`[backfill] ${pair}: no ticker, skipping.`); continue; }
 
-        while (nextUrl && pages < 10) {
-          const response = await withTimeout(
-            axios.get(nextUrl, { params, timeout: 25000 }),
-            30000, `backfill ${pair} ${chunk.from}→${chunk.to} page ${pages}`
-          );
-          params = {};
-          const results = (response.data && Array.isArray(response.data.results)) ? response.data.results : [];
+      console.log(`[backfill] Starting ${pair}...`);
+      let pairCandles = [];
+      // FIX #4: chunksFailed resets per pair (declared here, inside pair loop)
+      let chunksFailed = 0;
+      let pairAborted = false;
 
-          for (const bar of results) {
-            const open = bar.o, high = bar.h, low = bar.l, close = bar.c;
-            if (!open || !close || isNaN(open) || isNaN(close)) continue;
-            if (prev !== null && Math.abs(close - prev) / prev > 0.20) { prev = close; continue; }
-            const dt = new Date(bar.t).toISOString().slice(0, 19).replace('T', ' ');
-            pairCandles.push({ datetime: dt, open, high, low, close });
-            prev = close; kept++;
+      for (const chunk of chunks) {
+        if (pairAborted) break;
+        await new Promise(r => setImmediate(r));
+        try {
+          let nextUrl = `https://api.massive.com/v2/aggs/ticker/${ticker}/range/1/hour/${chunk.from}/${chunk.to}`;
+          let params = { adjusted: false, sort: 'asc', limit: 50000, apiKey: MASSIVE_API_KEY };
+          let prev = null, pages = 0;
+
+          while (nextUrl && pages < 10) {
+            const response = await withTimeout(
+              axios.get(nextUrl, { params, timeout: 25000 }),
+              30000, `backfill ${pair} ${chunk.from}→${chunk.to} page ${pages}`
+            );
+            params = {};
+            const results = (response.data && Array.isArray(response.data.results)) ? response.data.results : [];
+            for (const bar of results) {
+              const { o: open, h: high, l: low, c: close } = bar;
+              if (!open || !close || isNaN(open) || isNaN(close)) continue;
+              if (prev !== null && Math.abs(close - prev) / prev > 0.20) { prev = close; continue; }
+              const dt = new Date(bar.t).toISOString().slice(0, 19).replace('T', ' ');
+              pairCandles.push({ datetime: dt, open, high, low, close });
+              prev = close;
+            }
+            nextUrl = response.data.next_url ? response.data.next_url : null;
+            pages++;
+            if (nextUrl) await new Promise(r => setTimeout(r, 200));
           }
 
-          nextUrl = response.data.next_url ? response.data.next_url : null;
-          pages++;
-          if (nextUrl) await new Promise(r => setTimeout(r, 200));
-        }
+          // FIX #4: reset consecutive failure count on success
+          chunksFailed = 0;
+          await new Promise(r => setTimeout(r, 12000));
 
-        console.log(`[backfill] ${pair} ${chunk.from}→${chunk.to}: ${kept} candles kept.`);
-        // *** FIX: 12 second delay between chunks to stay under rate limit ***
-        await new Promise(r => setTimeout(r, 12000));
-
-      } catch (err) {
-        chunksFailed++;
-        const isRateLimit = err.response && err.response.status === 429;
-        const msg = err.response ? `HTTP ${err.response.status}: ${JSON.stringify(err.response.data)}` : err.message;
-        console.error(`[backfill] ${pair} ${chunk.from}→${chunk.to} failed (attempt ${chunksFailed}):`, msg);
-        if (chunksFailed >= 3) {
-          console.error(`[backfill] ${pair}: 3 consecutive failures, skipping to next pair.`);
-          break;
+        } catch (err) {
+          chunksFailed++;
+          const isRateLimit = err.response && err.response.status === 429;
+          const msg = err.response ? `HTTP ${err.response.status}: ${JSON.stringify(err.response.data)}` : err.message;
+          console.error(`[backfill] ${pair} ${chunk.from}→${chunk.to} failed (${chunksFailed}):`, msg);
+          if (chunksFailed >= 3) {
+            console.error(`[backfill] ${pair}: 3 consecutive failures, skipping pair.`);
+            pairAborted = true;
+            break;
+          }
+          const retryWait = isRateLimit ? 60000 : 30000;
+          await new Promise(r => setTimeout(r, retryWait));
         }
-        // *** FIX: 30 second retry wait (was 3s) — gives rate limit time to reset ***
-        const retryWait = isRateLimit ? 60000 : 30000;
-        console.log(`[backfill] ${pair}: waiting ${retryWait / 1000}s before retry...`);
-        await new Promise(r => setTimeout(r, retryWait));
       }
-    }
 
-    if (pairCandles.length === 0) {
-      progress[pair] = 'incomplete';
-      console.warn(`[backfill] ${pair}: 0 candles collected, marked incomplete.`);
+      if (pairCandles.length === 0 || pairAborted) {
+        progress[pair] = 'incomplete';
+        incompleteThisPass.push(pair);
+        try { fs.writeFileSync(BACKFILL_PROGRESS_PATH, JSON.stringify(progress), 'utf8'); } catch (_) {}
+        continue;
+      }
+
+      if (!candleStore.pairs[pair]) candleStore.pairs[pair] = [];
+      const mapByDt = {};
+      for (const c of candleStore.pairs[pair]) mapByDt[c.datetime] = c;
+      for (const c of pairCandles) mapByDt[c.datetime] = c;
+      candleStore.pairs[pair] = Object.values(mapByDt).sort((a, b) => a.datetime < b.datetime ? -1 : 1);
+
+      // FIX #1: increment counter with actual candle count
+      backfillTotalCandles += pairCandles.length;
+      historyCache.data.pairs[pair] = candleStore.pairs[pair].slice(-5000);
+
+      try { fs.writeFileSync(CANDLE_STORE_PATH, JSON.stringify(candleStore), 'utf8'); } catch (_) {}
+
+      progress[pair] = 'complete';
+      backfillPairsComplete++;
+      console.log(`[backfill] ${pair}: ${pairCandles.length} candles. Total: ${backfillTotalCandles}`);
       try { fs.writeFileSync(BACKFILL_PROGRESS_PATH, JSON.stringify(progress), 'utf8'); } catch (_) {}
-      continue;
+
+      await new Promise(r => setTimeout(r, 15000));
     }
 
-    if (!candleStore.pairs[pair]) candleStore.pairs[pair] = [];
-    const mapByDt = {};
-    for (const c of candleStore.pairs[pair]) mapByDt[c.datetime] = c;
-    for (const c of pairCandles) mapByDt[c.datetime] = c;
-    const merged = Object.values(mapByDt).sort((a, b) => a.datetime < b.datetime ? -1 : 1);
-    candleStore.pairs[pair] = merged;
-    backfillTotalCandles += pairCandles.length;
-    historyCache.data.pairs[pair] = merged.slice(-5000);
-
-    try { fs.writeFileSync(CANDLE_STORE_PATH, JSON.stringify(candleStore), 'utf8'); } catch (_) {}
-
-    progress[pair] = 'complete';
-    backfillPairsComplete++;
-    console.log(`[backfill] ${pair}: complete. ${pairCandles.length} candles stored. Total so far: ${backfillTotalCandles}`);
-    try { fs.writeFileSync(BACKFILL_PROGRESS_PATH, JSON.stringify(progress), 'utf8'); } catch (_) {}
-
-    // *** FIX: 15 second delay between pairs to stay under rate limit ***
-    await new Promise(r => setTimeout(r, 15000));
+    remainingPairs = incompleteThisPass;
+    if (remainingPairs.length > 0 && pass < MAX_PASSES) {
+      console.log(`[backfill] ${remainingPairs.length} pairs incomplete. Retrying in 60s...`);
+      await new Promise(r => setTimeout(r, 60000));
+    }
   }
 
-  backfillStatus = FOREX_PAIRS.every(p => progress[p] === 'complete') ? 'complete' : 'partial';
+  backfillStatus = FOREX_PAIRS.every(p => {
+    let prog = {};
+    try { prog = JSON.parse(fs.readFileSync(BACKFILL_PROGRESS_PATH, 'utf8')); } catch (_) {}
+    return prog[p] === 'complete';
+  }) ? 'complete' : 'partial';
+
   console.log(`[backfill] Done. Status: ${backfillStatus}. Total candles: ${backfillTotalCandles}`);
 
-  const incompletePairs = FOREX_PAIRS.filter(p => progress[p] !== 'complete');
-  if (incompletePairs.length > 0) {
-    console.log(`[backfill] Retrying ${incompletePairs.length} incomplete pairs in 60s...`);
-    await new Promise(r => setTimeout(r, 60000));
-    for (const pair of incompletePairs) {
-      delete progress[pair];
-      try { fs.writeFileSync(BACKFILL_PROGRESS_PATH, JSON.stringify(progress), 'utf8'); } catch (_) {}
-    }
-    await runMassiveBackfill();
+  // FIX #3: only schedule intelligence if we have enough data
+  scheduleIntelligenceIfReady();
+}
+
+// FIX #3: smart intelligence scheduling
+function scheduleIntelligenceIfReady() {
+  const totalCandles = FOREX_PAIRS.reduce((sum, p) => sum + (candleStore.pairs[p] || []).length, 0);
+  if (totalCandles < 200 * FOREX_PAIRS.length) {
+    console.log(`[intelligence] Not enough candles (${totalCandles}) to calculate profile. Will retry in 1h.`);
+    setTimeout(scheduleIntelligenceIfReady, 60 * 60 * 1000);
+    return;
   }
+  calculateIntelligenceProfile();
 }
 
 // --- Intelligence profile ---
@@ -416,10 +528,7 @@ async function calculateIntelligenceProfile() {
     if (!candles || candles.length < 200) { profile[pair] = { status: 'insufficient_data' }; continue; }
     const atrs = calculateATR(candles, 14).filter(v => !isNaN(v));
     const atrSort = [...atrs].sort((a, b) => a - b);
-    const atrPercentiles = {
-      p25: percentile(atrSort, 25), p50: percentile(atrSort, 50),
-      p75: percentile(atrSort, 75), p95: percentile(atrSort, 95)
-    };
+    const atrPercentiles = { p25: percentile(atrSort, 25), p50: percentile(atrSort, 50), p75: percentile(atrSort, 75), p95: percentile(atrSort, 95) };
     const recentATR = calculateATR(candles.slice(-15), 14).filter(v => !isNaN(v));
     const currentATR = recentATR.length ? recentATR[recentATR.length - 1] : atrPercentiles.p50;
     const volatilityRegime = currentATR < atrPercentiles.p25 ? 'low' : currentATR < atrPercentiles.p75 ? 'normal' : currentATR < atrPercentiles.p95 ? 'high' : 'extreme';
@@ -442,17 +551,13 @@ async function calculateIntelligenceProfile() {
         const score = wins / total; if (score > bestScore) { bestScore = score; bestOversold = os; bestOverbought = ob; }
       }
     }
-    profile[pair] = {
-      adaptiveRSI: { oversold: bestOversold, overbought: bestOverbought },
-      atrPercentiles, volatilityRegime, profileVersion: 1,
-      lastCalculated: new Date().toISOString(), status: 'active'
-    };
+    profile[pair] = { adaptiveRSI: { oversold: bestOversold, overbought: bestOverbought }, atrPercentiles, volatilityRegime, profileVersion: 1, lastCalculated: new Date().toISOString(), status: 'active' };
   }
   intelligenceProfile = profile;
   intelligenceStatus = 'active';
   intelligenceLastCalculated = profile._calculatedAt;
-  try { fs.writeFileSync(INTELLIGENCE_PROFILE_PATH, JSON.stringify(profile), 'utf8'); }
-  catch (err) { console.error('[intelligence] Failed to persist profile:', err.message); }
+  try { fs.writeFileSync(INTELLIGENCE_PROFILE_PATH, JSON.stringify(profile), 'utf8'); } catch (err) { console.error('[intelligence] Failed to persist:', err.message); }
+  console.log('[intelligence] Profile calculated and saved.');
 }
 
 // --- SMC evaluation ---
@@ -485,24 +590,41 @@ async function runSMCEvaluation() {
         ? Math.min(100, Math.round(60 + (oversold - lastRSI) * 2))
         : Math.min(100, Math.round(60 + (lastRSI - overbought) * 2));
       const adjustedConfidence = Math.max(0, rawConfidence - dxyPenalty);
-      const signalTypeKey = smcEngine.computeSignalTypeKey({ orderBlockPresent: trinity.orderBlockPresent, fvgPresent: trinity.fvgPresent, liquiditySweepPresent: trinity.liquiditySweepPresent });
+
+      // FIX #12: ensure signalTypeKey never uses undefined values
+      const signalTypeKey = smcEngine.computeSignalTypeKey({
+        orderBlockPresent: trinity.orderBlockPresent === true,
+        fvgPresent: trinity.fvgPresent === true,
+        liquiditySweepPresent: trinity.liquiditySweepPresent === true
+      });
+
       const classification = smcEngine.classifySignal(trinity, true, killzone);
       const now = new Date();
       const signalBase = {
         pair, direction: candidateDirection, confidence: adjustedConfidence,
-        orderBlockPresent: trinity.orderBlockPresent, fvgPresent: trinity.fvgPresent,
-        liquiditySweepPresent: trinity.liquiditySweepPresent, killzoneActive: killzone.active,
-        killzoneName: killzone.killzoneName, dxyBias: currentDXYBias, obZone: trinity.obZone,
-        fvgZone: trinity.fvgZone, ensembleScore: null, signalTypeKey, generatedAt: now.toISOString()
+        orderBlockPresent: trinity.orderBlockPresent === true,
+        fvgPresent: trinity.fvgPresent === true,
+        liquiditySweepPresent: trinity.liquiditySweepPresent === true,
+        killzoneActive: killzone.active,
+        killzoneName: killzone.killzoneName || null,
+        dxyBias: currentDXYBias,
+        obZone: trinity.obZone || null,
+        fvgZone: trinity.fvgZone || null,
+        ensembleScore: null, signalTypeKey, generatedAt: now.toISOString()
       };
+
       let ensembleScore = null;
       if (classification === 'LIVE' || classification === 'STANDARD') {
         try {
           const features = ensembleScorer.extractFeatures(signalBase, null);
           const score = await ensembleScorer.scoreSignal(features);
           if (score !== null) ensembleScore = score;
-        } catch (_) {}
+        } catch (ensErr) {
+          // FIX #13: log ensemble errors instead of swallowing silently
+          console.warn(`[ensemble] Scoring failed for ${pair}:`, ensErr.message);
+        }
       }
+
       if (classification === 'LIVE') {
         if (ensembleScore !== null && ensembleScore < 40) {
           const ps = { ...signalBase, ensembleScore, isPaper: true, paperReason: 'ENSEMBLE_LOW_SCORE' };
@@ -510,7 +632,7 @@ async function runSMCEvaluation() {
           paperSignalsBuffer.push(ps);
         } else {
           lastHolyTrinityAt[pair] = now;
-          console.log(`[SMC] LIVE signal: ${pair} ${candidateDirection} (confidence ${adjustedConfidence}, ensemble ${ensembleScore !== null ? ensembleScore : 'N/A'})`);
+          console.log(`[SMC] LIVE signal: ${pair} ${candidateDirection} conf=${adjustedConfidence} ensemble=${ensembleScore ?? 'N/A'}`);
         }
       } else if (classification === 'PAPER_OUTSIDE_KILLZONE' || classification === 'PAPER_INDICATOR_FAILED') {
         const ps = { ...signalBase, ensembleScore: null, isPaper: true, paperReason: classification };
@@ -521,74 +643,27 @@ async function runSMCEvaluation() {
           const ps = { ...signalBase, confidence: Math.min(70, adjustedConfidence), ensembleScore, isPaper: true, paperReason: 'ENSEMBLE_LOW_SCORE' };
           if (paperSignalsBuffer.length >= PAPER_SIGNALS_MAX) paperSignalsBuffer.shift();
           paperSignalsBuffer.push(ps);
-        } else {
-          console.log(`[SMC] STANDARD signal: ${pair} ${candidateDirection} (confidence ${Math.min(70, adjustedConfidence)})`);
         }
       }
-      const holyTrinityAge = lastHolyTrinityAt[pair] ? (now - lastHolyTrinityAt[pair]) / 1000 / 3600 : Infinity;
-      if (holyTrinityAge > 24 && classification !== 'LIVE' && adjustedConfidence >= 50) {
-        console.log(`[SMC] FALLBACK signal: ${pair} ${candidateDirection} (24h without Holy Trinity)`);
-      }
-    } catch (err) { console.error(`[SMC] Evaluation error for ${pair}:`, err.message); }
+    } catch (err) { console.error(`[SMC] Error for ${pair}:`, err.message); }
   }
 }
 
 // --- Routes ---
-app.get('/ensemble-status', (req, res) => { cors(res); res.json(ensembleScorer.getEnsembleStatus()); });
 
-app.get('/paper-signals', (req, res) => {
-  cors(res);
-  const limit = req.query.limit ? parseInt(req.query.limit, 10) : paperSignalsBuffer.length;
-  const safe = isNaN(limit) ? paperSignalsBuffer.length : Math.min(limit, paperSignalsBuffer.length);
-  res.json({ count: paperSignalsBuffer.length, signals: paperSignalsBuffer.slice(-safe) });
-});
-
-app.get('/smc-status', (req, res) => {
-  cors(res);
-  try {
-    const killzone = smcEngine.isInsideKillzone();
-    const activePairs = {};
-    for (const pair of FOREX_PAIRS) {
-      const candles = candleStore.pairs[pair];
-      if (!candles || candles.length < 50) { activePairs[pair] = { activeOBCount: 0, activeFVGCount: 0, lastSweepAge: null, premiumDiscount: 'UNKNOWN' }; continue; }
-      const obs = smcEngine.detectOrderBlocks(candles, 'BUY').length + smcEngine.detectOrderBlocks(candles, 'SELL').length;
-      const fvgs = smcEngine.detectFairValueGaps(candles, 'BUY').length + smcEngine.detectFairValueGaps(candles, 'SELL').length;
-      const sweep = smcEngine.detectLiquiditySweep(candles);
-      const pdZone = smcEngine.getPremiumDiscountZone(candles);
-      activePairs[pair] = {
-        activeOBCount: obs, activeFVGCount: fvgs,
-        lastSweepAge: sweep.sweepCandleIndex !== null ? candles.length - 1 - sweep.sweepCandleIndex : null,
-        premiumDiscount: pdZone.isPremium ? 'PREMIUM' : pdZone.isDiscount ? 'DISCOUNT' : 'NEUTRAL'
-      };
-    }
-    res.json({ dxyBias: currentDXYBias, dxyLastFetched: dxyLastFetchedAt, killzoneActive: killzone.active, killzoneName: killzone.killzoneName, activePairs });
-  } catch (err) { res.status(500).json({ error: 'SMC status unavailable' }); }
-});
-
+// Public routes
 app.get('/rates', (req, res) => { cors(res); res.json(ratesCache.data); });
 app.get('/history', (req, res) => { cors(res); res.json(historyCache.data); });
-
-app.get('/stored-history', (req, res) => {
-  cors(res);
-  const limit = req.query.limit ? parseInt(req.query.limit, 10) : null;
-  if (!limit || isNaN(limit)) return res.json(candleStore);
-  const limited = { pairs: {} };
-  for (const pair of Object.keys(candleStore.pairs)) limited.pairs[pair] = candleStore.pairs[pair].slice(-limit);
-  return res.json(limited);
-});
-
 app.get('/calendar', (req, res) => {
   cors(res);
   res.json({ events: calendarCache.data, fetchedAt: calendarCache.fetchedAt ? new Date(calendarCache.fetchedAt).toISOString() : null, count: calendarCache.data.length });
 });
-
 app.get('/intelligence', (req, res) => {
   cors(res);
-  if (!intelligenceProfile || intelligenceStatus === 'calculating' || intelligenceStatus === 'pending')
-    return res.json({ status: 'calculating', pairsComplete: backfillPairsComplete, pairsTotal: FOREX_PAIRS.length });
+  if (!intelligenceProfile || intelligenceStatus !== 'active')
+    return res.json({ status: intelligenceStatus, pairsComplete: backfillPairsComplete, pairsTotal: FOREX_PAIRS.length });
   res.json({ status: 'active', profile: intelligenceProfile, fetchedAt: intelligenceLastCalculated, profileVersion: 1 });
 });
-
 app.get('/status', (req, res) => {
   cors(res);
   const storeCounts = {};
@@ -602,20 +677,60 @@ app.get('/status', (req, res) => {
     lastCollectionError: lastCollectionError || null
   });
 });
-
 app.get('/health', (req, res) => {
   cors(res);
-  res.json({
-    status: 'ok', uptime: process.uptime(),
-    ratesCachedAt: ratesCache.fetchedAt ? new Date(ratesCache.fetchedAt).toISOString() : null,
-    historyCachedAt: historyCache.fetchedAt ? new Date(historyCache.fetchedAt).toISOString() : null,
-    intelligenceStatus
-  });
+  res.json({ status: 'ok', uptime: process.uptime(), ratesCachedAt: ratesCache.fetchedAt ? new Date(ratesCache.fetchedAt).toISOString() : null, historyCachedAt: historyCache.fetchedAt ? new Date(historyCache.fetchedAt).toISOString() : null, intelligenceStatus });
+});
+app.get('/stored-history', (req, res) => {
+  cors(res);
+  const limit = req.query.limit ? parseInt(req.query.limit, 10) : null;
+  if (!limit || isNaN(limit)) return res.json(candleStore);
+  const limited = { pairs: {} };
+  for (const pair of Object.keys(candleStore.pairs)) limited.pairs[pair] = candleStore.pairs[pair].slice(-limit);
+  return res.json(limited);
+});
+
+// FIX #6: Protected routes require X-ForexMind-Key header
+app.get('/paper-signals', (req, res) => {
+  cors(res);
+  if (!requireAuth(req, res)) return;
+  const limit = req.query.limit ? parseInt(req.query.limit, 10) : paperSignalsBuffer.length;
+  const safe = isNaN(limit) ? paperSignalsBuffer.length : Math.min(limit, paperSignalsBuffer.length);
+  res.json({ count: paperSignalsBuffer.length, signals: paperSignalsBuffer.slice(-safe) });
+});
+app.get('/resolved-signals', (req, res) => {
+  cors(res);
+  if (!requireAuth(req, res)) return;
+  const limit = req.query.limit ? parseInt(req.query.limit, 10) : 200;
+  res.json({ count: resolvedSignalsBuffer.length, signals: resolvedSignalsBuffer.slice(-limit) });
+});
+app.get('/smc-status', (req, res) => {
+  cors(res);
+  if (!requireAuth(req, res)) return;
+  try {
+    const killzone = smcEngine.isInsideKillzone();
+    const activePairs = {};
+    for (const pair of FOREX_PAIRS) {
+      const candles = candleStore.pairs[pair];
+      if (!candles || candles.length < 50) { activePairs[pair] = { activeOBCount: 0, activeFVGCount: 0, lastSweepAge: null, premiumDiscount: 'UNKNOWN' }; continue; }
+      const obs = smcEngine.detectOrderBlocks(candles, 'BUY').length + smcEngine.detectOrderBlocks(candles, 'SELL').length;
+      const fvgs = smcEngine.detectFairValueGaps(candles, 'BUY').length + smcEngine.detectFairValueGaps(candles, 'SELL').length;
+      const sweep = smcEngine.detectLiquiditySweep(candles);
+      const pdZone = smcEngine.getPremiumDiscountZone(candles);
+      activePairs[pair] = { activeOBCount: obs, activeFVGCount: fvgs, lastSweepAge: sweep.sweepCandleIndex !== null ? candles.length - 1 - sweep.sweepCandleIndex : null, premiumDiscount: pdZone.isPremium ? 'PREMIUM' : pdZone.isDiscount ? 'DISCOUNT' : 'NEUTRAL' };
+    }
+    res.json({ dxyBias: currentDXYBias, dxyLastFetched: dxyLastFetchedAt, killzoneActive: killzone.active, killzoneName: killzone.killzoneName, activePairs });
+  } catch (err) { res.status(500).json({ error: 'SMC status unavailable' }); }
+});
+app.get('/ensemble-status', (req, res) => {
+  cors(res);
+  if (!requireAuth(req, res)) return;
+  res.json(ensembleScorer.getEnsembleStatus());
 });
 
 // --- Start ---
 app.listen(PORT, async () => {
-  console.log(`[${new Date().toISOString()}] ForexMind proxy running on port ${PORT}`);
+  console.log(`[${new Date().toISOString()}] ForexMind proxy on port ${PORT}`);
   try { fs.mkdirSync('/data', { recursive: true }); } catch (_) {}
 
   await restoreFromCanister();
@@ -628,7 +743,7 @@ app.listen(PORT, async () => {
   setInterval(runCollectionWithSMC, 15 * 60 * 1000);
 
   smcEngine.fetchDXYData()
-    .then(data => { currentDXYBias = smcEngine.calculateDXYTrend(data); dxyLastFetchedAt = new Date().toISOString(); console.log(`[DXY] Initial trend: ${currentDXYBias}`); })
+    .then(data => { currentDXYBias = smcEngine.calculateDXYTrend(data); dxyLastFetchedAt = new Date().toISOString(); console.log(`[DXY] Initial: ${currentDXYBias}`); })
     .catch(err => console.warn('[DXY] Initial fetch failed:', err.message));
 
   fetchCalendar();
@@ -636,30 +751,48 @@ app.listen(PORT, async () => {
 
   setImmediate(() => runMassiveBackfill());
 
-  setTimeout(() => calculateIntelligenceProfile(), 2 * 60 * 1000);
+  // FIX #3: intelligence only scheduled from backfill completion or if data already present
+  const existingCandles = FOREX_PAIRS.reduce((sum, p) => sum + (candleStore.pairs[p] || []).length, 0);
+  if (existingCandles >= 200 * FOREX_PAIRS.length && !intelligenceProfile) {
+    setTimeout(() => calculateIntelligenceProfile(), 2 * 60 * 1000);
+  }
   setInterval(() => calculateIntelligenceProfile(), 7 * 24 * 60 * 60 * 1000);
 
+  // Load resolved signals into ensemble scorer on startup
   setTimeout(async () => {
     const CANISTER_HOST = process.env.CANISTER_HOST || null;
     const CANISTER_ID = process.env.CANISTER_ID || null;
-    if (!CANISTER_HOST || !CANISTER_ID) { console.log('[Ensemble] CANISTER_HOST or CANISTER_ID not set. Skipping training fetch.'); return; }
-    const allSignals = []; let page = 0, done = false;
-    while (!done) {
-      try {
-        const resp = await withTimeout(
-          axios.post(`${CANISTER_HOST}/api/v1/query`, { canisterId: CANISTER_ID, method: 'getSignalPage', args: ['ALL', page, 100] }, { timeout: 15000 }),
-          20000, `ensemble training page ${page}`
-        );
-        const signals = (resp.data && Array.isArray(resp.data.result)) ? resp.data.result : [];
-        if (signals.length === 0) { done = true; break; }
-        for (const s of signals) {
-          if (s.outcome && s.outcome !== 'Pending') allSignals.push({ features: ensembleScorer.extractFeatures(s, null), outcome: s.outcome === 'Win' });
-        }
-        if (signals.length < 100) { done = true; break; }
-        page++;
-      } catch (err) { done = true; }
+
+    let allSignals = [];
+
+    // First use local resolved signals
+    if (resolvedSignalsBuffer.length >= 100) {
+      allSignals = resolvedSignalsBuffer.map(s => ({
+        features: ensembleScorer.extractFeatures(s, null), outcome: s.outcome === 'Win'
+      }));
     }
-    console.log(`[Ensemble] Fetched ${allSignals.length} resolved signals.`);
-    ensembleScorer.initEnsembleScorer(allSignals);
+
+    // Then supplement from canister if available
+    if (CANISTER_HOST && CANISTER_ID) {
+      let page = 0, done = false;
+      while (!done) {
+        try {
+          const resp = await withTimeout(
+            axios.post(`${CANISTER_HOST}/api/v1/query`, { canisterId: CANISTER_ID, method: 'getSignalPage', args: ['ALL', page, 100] }, { timeout: 15000 }),
+            20000, `ensemble training page ${page}`
+          );
+          const signals = (resp.data && Array.isArray(resp.data.result)) ? resp.data.result : [];
+          if (signals.length === 0) { done = true; break; }
+          for (const s of signals) {
+            if (s.outcome && s.outcome !== 'Pending') allSignals.push({ features: ensembleScorer.extractFeatures(s, null), outcome: s.outcome === 'Win' });
+          }
+          if (signals.length < 100) { done = true; break; }
+          page++;
+        } catch (_) { done = true; }
+      }
+    }
+
+    console.log(`[Ensemble] ${allSignals.length} resolved signals for training.`);
+    if (allSignals.length >= 100) ensembleScorer.initEnsembleScorer(allSignals);
   }, 30 * 1000);
 });
