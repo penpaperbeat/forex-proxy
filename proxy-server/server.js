@@ -20,7 +20,6 @@ const MASSIVE_TICKER_MAP = {
   'USD/CHF': 'C:USDCHF', 'AUD/USD': 'C:AUDUSD', 'USD/CAD': 'C:USDCAD', 'NZD/USD': 'C:NZDUSD'
 };
 
-// *** CHANGED: /tmp → /data for Railway persistent volume ***
 const CANDLE_STORE_PATH = '/data/candle-store.json';
 const BACKFILL_PROGRESS_PATH = '/data/backfill-progress.json';
 const INTELLIGENCE_PROFILE_PATH = '/data/intelligence-profile.json';
@@ -59,6 +58,15 @@ function incrementCallCount() {
 
 function cors(res) { res.setHeader('Access-Control-Allow-Origin', '*'); }
 
+// --- Timeout helper: rejects after ms ---
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`TIMEOUT after ${ms}ms: ${label}`)), ms);
+    promise.then(val => { clearTimeout(timer); resolve(val); })
+           .catch(err => { clearTimeout(timer); reject(err); });
+  });
+}
+
 // --- Load candle store from disk on startup ---
 try {
   if (fs.existsSync(CANDLE_STORE_PATH)) {
@@ -83,7 +91,7 @@ try {
   }
 } catch (err) { console.error('[startup] Failed to load intelligence profile:', err.message); intelligenceProfile = null; }
 
-// --- Restore candle store from canister on startup (if /data was empty) ---
+// --- Restore candle store from canister on startup ---
 async function restoreFromCanister() {
   const CANISTER_HOST = process.env.CANISTER_HOST || null;
   const CANISTER_ID = process.env.CANISTER_ID || null;
@@ -94,11 +102,14 @@ async function restoreFromCanister() {
   console.log('[restore] Restoring candle store from canister...');
   for (const pair of FOREX_PAIRS) {
     try {
-      const resp = await axios.post(`${CANISTER_HOST}/api/v1/query`, {
-        canisterId: CANISTER_ID,
-        method: 'getStoredCandles',
-        args: [pair]
-      }, { timeout: 15000 });
+      const resp = await withTimeout(
+        axios.post(`${CANISTER_HOST}/api/v1/query`, {
+          canisterId: CANISTER_ID,
+          method: 'getStoredCandles',
+          args: [pair]
+        }, { timeout: 15000 }),
+        20000, `restoreFromCanister ${pair}`
+      );
       const candles = (resp.data && Array.isArray(resp.data.result)) ? resp.data.result : [];
       if (candles.length > 0) {
         if (!candleStore.pairs[pair]) candleStore.pairs[pair] = [];
@@ -161,9 +172,12 @@ async function runCollection() {
     const pair = FOREX_PAIRS[i];
     if (i > 0) await new Promise(r => setTimeout(r, 2000));
     try {
-      const response = await axios.get('https://api.twelvedata.com/exchange_rate', {
-        params: { symbol: pair, apikey: API_KEY }, timeout: 10000
-      });
+      const response = await withTimeout(
+        axios.get('https://api.twelvedata.com/exchange_rate', {
+          params: { symbol: pair, apikey: API_KEY }, timeout: 10000
+        }),
+        15000, `rates ${pair}`
+      );
       if (response.data && response.data.rate) {
         ratesCache.data.pairs[pair] = { price: String(response.data.rate), fetchedAt: new Date().toISOString() };
         ratesCache.fetchedAt = Date.now();
@@ -181,9 +195,12 @@ async function runCollection() {
       const pair = FOREX_PAIRS[i];
       if (i > 0) await new Promise(r => setTimeout(r, 2000));
       try {
-        const response = await axios.get('https://api.twelvedata.com/time_series', {
-          params: { symbol: pair, interval: '1h', outputsize: 5000, apikey: API_KEY }, timeout: 30000
-        });
+        const response = await withTimeout(
+          axios.get('https://api.twelvedata.com/time_series', {
+            params: { symbol: pair, interval: '1h', outputsize: 5000, apikey: API_KEY }, timeout: 30000
+          }),
+          40000, `history ${pair}`
+        );
         const newCandles = (response.data.values || []).map(c => ({
           datetime: c.datetime, open: parseFloat(c.open), high: parseFloat(c.high),
           low: parseFloat(c.low), close: parseFloat(c.close)
@@ -217,9 +234,12 @@ async function fetchCalendar() {
   const to = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
   if (FINNHUB_API_KEY) {
     try {
-      const response = await axios.get('https://finnhub.io/api/v1/calendar/economic', {
-        params: { from, to, token: FINNHUB_API_KEY }, timeout: 10000
-      });
+      const response = await withTimeout(
+        axios.get('https://finnhub.io/api/v1/calendar/economic', {
+          params: { from, to, token: FINNHUB_API_KEY }, timeout: 10000
+        }),
+        15000, 'fetchCalendar finnhub'
+      );
       const events = (response.data.economicCalendar || [])
         .filter(e => (e.impact || '').toLowerCase() === 'high' && RELEVANT_CURRENCIES.includes((e.country || '').toUpperCase()))
         .map(e => ({ time: e.time, currency: e.country, event: e.event, impact: e.impact, forecast: e.estimate || null, previous: e.prev || null }));
@@ -228,7 +248,10 @@ async function fetchCalendar() {
     } catch (err) { console.error('[calendar] Finnhub fetch failed:', err.message); }
   }
   try {
-    const rssResponse = await axios.get('https://nfs.faireconomy.media/ff_calendar_thisweek.xml', { timeout: 10000 });
+    const rssResponse = await withTimeout(
+      axios.get('https://nfs.faireconomy.media/ff_calendar_thisweek.xml', { timeout: 10000 }),
+      15000, 'fetchCalendar forexfactory'
+    );
     const xml = rssResponse.data, events = [];
     const itemRe = /<item>([\s\S]*?)<\/item>/g; let match;
     while ((match = itemRe.exec(xml)) !== null) {
@@ -245,7 +268,7 @@ async function fetchCalendar() {
   } catch (err) { console.error('[calendar] ForexFactory RSS fallback failed:', err.message); }
 }
 
-// --- Massive.com backfill ---
+// --- Massive.com backfill (with per-chunk hard timeout) ---
 async function runMassiveBackfill() {
   backfillStatus = 'running';
   console.log('[backfill] Starting Massive.com backfill...');
@@ -306,7 +329,11 @@ async function runMassiveBackfill() {
         let kept = 0, prev = null, pages = 0;
 
         while (nextUrl && pages < 10) {
-          const response = await axios.get(nextUrl, { params, timeout: 30000 });
+          // *** FIX: hard 30s timeout per page fetch — stalled requests no longer hang forever ***
+          const response = await withTimeout(
+            axios.get(nextUrl, { params, timeout: 25000 }),
+            30000, `backfill ${pair} ${chunk.from}→${chunk.to} page ${pages}`
+          );
           params = {};
           const results = (response.data && Array.isArray(response.data.results)) ? response.data.results : [];
 
@@ -331,18 +358,19 @@ async function runMassiveBackfill() {
       } catch (err) {
         chunksFailed++;
         const msg = err.response ? `HTTP ${err.response.status}: ${JSON.stringify(err.response.data)}` : err.message;
-        console.error(`[backfill] ${pair} ${chunk.from}→${chunk.to} failed:`, msg);
+        console.error(`[backfill] ${pair} ${chunk.from}→${chunk.to} failed (attempt ${chunksFailed}):`, msg);
+        // Skip to next pair after 3 consecutive failures
         if (chunksFailed >= 3) {
-          console.error(`[backfill] ${pair}: too many chunk failures, skipping pair.`);
+          console.error(`[backfill] ${pair}: 3 consecutive failures, skipping to next pair.`);
           break;
         }
-        await new Promise(r => setTimeout(r, 2000));
+        await new Promise(r => setTimeout(r, 3000));
       }
     }
 
     if (pairCandles.length === 0) {
       progress[pair] = 'incomplete';
-      console.warn(`[backfill] ${pair}: 0 candles collected.`);
+      console.warn(`[backfill] ${pair}: 0 candles collected, marked incomplete.`);
       try { fs.writeFileSync(BACKFILL_PROGRESS_PATH, JSON.stringify(progress), 'utf8'); } catch (_) {}
       continue;
     }
@@ -368,6 +396,18 @@ async function runMassiveBackfill() {
 
   backfillStatus = FOREX_PAIRS.every(p => progress[p] === 'complete') ? 'complete' : 'partial';
   console.log(`[backfill] Done. Status: ${backfillStatus}. Total candles: ${backfillTotalCandles}`);
+
+  // Retry incomplete pairs once after full pass
+  const incompletePairs = FOREX_PAIRS.filter(p => progress[p] !== 'complete');
+  if (incompletePairs.length > 0) {
+    console.log(`[backfill] Retrying ${incompletePairs.length} incomplete pairs in 60s...`);
+    await new Promise(r => setTimeout(r, 60000));
+    for (const pair of incompletePairs) {
+      delete progress[pair];
+      try { fs.writeFileSync(BACKFILL_PROGRESS_PATH, JSON.stringify(progress), 'utf8'); } catch (_) {}
+    }
+    await runMassiveBackfill();
+  }
 }
 
 // --- Intelligence profile ---
@@ -615,7 +655,10 @@ app.listen(PORT, async () => {
     const allSignals = []; let page = 0, done = false;
     while (!done) {
       try {
-        const resp = await axios.post(`${CANISTER_HOST}/api/v1/query`, { canisterId: CANISTER_ID, method: 'getSignalPage', args: ['ALL', page, 100] }, { timeout: 15000 });
+        const resp = await withTimeout(
+          axios.post(`${CANISTER_HOST}/api/v1/query`, { canisterId: CANISTER_ID, method: 'getSignalPage', args: ['ALL', page, 100] }, { timeout: 15000 }),
+          20000, `ensemble training page ${page}`
+        );
         const signals = (resp.data && Array.isArray(resp.data.result)) ? resp.data.result : [];
         if (signals.length === 0) { done = true; break; }
         for (const s of signals) {
