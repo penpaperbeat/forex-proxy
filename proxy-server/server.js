@@ -23,7 +23,7 @@ const BID_TO_MID = {
 };
 
 const CANDLE_STORE_PATH = '/tmp/candle-store.json';
-const BACKFILL_PROGRESS_PATH = '/tmp/backfill-progress.json';
+const BACKFILL_PROGRESS_PATH = '/tmp/backfill-progress-v2.json';
 const INTELLIGENCE_PROFILE_PATH = '/tmp/intelligence-profile.json';
 const CALENDAR_CACHE_TTL = 60 * 60 * 1000;
 const INTELLIGENCE_RECALC_INTERVAL = 30 * 24 * 60 * 60 * 1000;
