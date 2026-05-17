@@ -3,6 +3,7 @@
 const express = require('express');
 const axios = require('axios');
 const fs = require('fs');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -14,6 +15,9 @@ const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
 const MASSIVE_API_KEY = process.env.MASSIVE_API_KEY || '';
 const PROXY_SECRET = process.env.PROXY_SECRET || '';
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
+const PROXY_IDENTITY_KEY = process.env.PROXY_IDENTITY_KEY || null;
+const CANISTER_HOST = process.env.CANISTER_HOST || null;
+const CANISTER_ID = process.env.CANISTER_ID || null;
 
 const FOREX_PAIRS = (process.env.FOREX_PAIRS || 'EUR/USD,GBP/USD,USD/JPY,USD/CHF,AUD/USD,USD/CAD,NZD/USD')
   .split(',').map(p => p.trim());
@@ -88,6 +92,123 @@ function withTimeout(promise, ms, label) {
   });
 }
 
+// --- Canister identity signing ---
+// Signs a request body with the proxy's Ed25519 private key so the canister
+// can verify the caller is the authorized proxy principal.
+function signRequest(body) {
+  if (!PROXY_IDENTITY_KEY) return null;
+  try {
+    const privDer = Buffer.from(PROXY_IDENTITY_KEY, 'hex');
+    const privateKey = crypto.createPrivateKey({ key: privDer, format: 'der', type: 'pkcs8' });
+    const payload = JSON.stringify(body);
+    const signature = crypto.sign(null, Buffer.from(payload), privateKey);
+    return signature.toString('hex');
+  } catch (err) {
+    console.warn('[canister] Failed to sign request:', err.message);
+    return null;
+  }
+}
+
+// --- Push signal to canister ---
+async function pushSignalToCanister(signal) {
+  if (!CANISTER_HOST || !CANISTER_ID || !PROXY_IDENTITY_KEY) return;
+  try {
+    const body = {
+      canisterId: CANISTER_ID,
+      method: 'pushPaperSignal',
+      args: [{
+        pair: signal.pair,
+        direction: signal.direction,
+        confidence: signal.confidence,
+        entry: signal.entry || 0,
+        stopLoss: signal.stopLoss || 0,
+        takeProfit: signal.takeProfit || 0,
+        atr: signal.atr || 0,
+        orderBlockPresent: signal.orderBlockPresent,
+        fvgPresent: signal.fvgPresent,
+        liquiditySweepPresent: signal.liquiditySweepPresent,
+        killzoneActive: signal.killzoneActive,
+        killzoneName: signal.killzoneName || '',
+        dxyBias: signal.dxyBias || 'NEUTRAL',
+        ensembleScore: signal.ensembleScore || 0,
+        signalTypeKey: signal.signalTypeKey || 0,
+        generatedAt: signal.generatedAt,
+        isPaper: signal.isPaper || false,
+        paperReason: signal.paperReason || ''
+      }]
+    };
+    const signature = signRequest(body);
+    await withTimeout(
+      axios.post(`${CANISTER_HOST}/api/v1/update`, body, {
+        headers: signature ? { 'X-Proxy-Signature': signature } : {},
+        timeout: 15000
+      }),
+      20000, `pushSignalToCanister ${signal.pair}`
+    );
+    console.log(`[canister] Signal pushed: ${signal.pair} ${signal.direction}`);
+  } catch (err) {
+    console.warn(`[canister] pushSignalToCanister failed for ${signal.pair}:`, err.message);
+  }
+}
+
+// --- Push candles to canister ---
+async function pushCandlesToCanister(pair, candles) {
+  if (!CANISTER_HOST || !CANISTER_ID || !PROXY_IDENTITY_KEY) return;
+  if (!candles || candles.length === 0) return;
+  try {
+    // Push in batches of 500 to avoid payload size limits
+    const BATCH_SIZE = 500;
+    for (let i = 0; i < candles.length; i += BATCH_SIZE) {
+      const batch = candles.slice(i, i + BATCH_SIZE);
+      const body = {
+        canisterId: CANISTER_ID,
+        method: 'pushCandles',
+        args: [pair, batch.map(c => ({
+          datetime: c.datetime,
+          open: c.open,
+          high: c.high,
+          low: c.low,
+          close: c.close
+        }))]
+      };
+      const signature = signRequest(body);
+      await withTimeout(
+        axios.post(`${CANISTER_HOST}/api/v1/update`, body, {
+          headers: signature ? { 'X-Proxy-Signature': signature } : {},
+          timeout: 20000
+        }),
+        25000, `pushCandlesToCanister ${pair} batch ${i}`
+      );
+      if (i + BATCH_SIZE < candles.length) await new Promise(r => setTimeout(r, 500));
+    }
+    console.log(`[canister] Candles pushed for ${pair}: ${candles.length} candles`);
+  } catch (err) {
+    console.warn(`[canister] pushCandlesToCanister failed for ${pair}:`, err.message);
+  }
+}
+
+// --- Push resolved signal outcome to canister ---
+async function pushOutcomeToCanister(signalId, isWin) {
+  if (!CANISTER_HOST || !CANISTER_ID || !PROXY_IDENTITY_KEY) return;
+  try {
+    const body = {
+      canisterId: CANISTER_ID,
+      method: 'recordPaperSignalOutcome',
+      args: [signalId, isWin]
+    };
+    const signature = signRequest(body);
+    await withTimeout(
+      axios.post(`${CANISTER_HOST}/api/v1/update`, body, {
+        headers: signature ? { 'X-Proxy-Signature': signature } : {},
+        timeout: 15000
+      }),
+      20000, `pushOutcomeToCanister ${signalId}`
+    );
+  } catch (err) {
+    console.warn(`[canister] pushOutcomeToCanister failed for ${signalId}:`, err.message);
+  }
+}
+
 // --- Load candle store from disk on startup ---
 try {
   if (fs.existsSync(CANDLE_STORE_PATH)) {
@@ -122,8 +243,6 @@ try {
 
 // --- Restore candle store from canister on startup ---
 async function restoreFromCanister() {
-  const CANISTER_HOST = process.env.CANISTER_HOST || null;
-  const CANISTER_ID = process.env.CANISTER_ID || null;
   if (!CANISTER_HOST || !CANISTER_ID) {
     console.log('[restore] CANISTER_HOST or CANISTER_ID not set. Skipping.');
     return;
@@ -218,6 +337,11 @@ function resolveOldSignals() {
     const resolved = { ...signal, outcome, resolvedAt: new Date().toISOString() };
     resolvedSignalsBuffer.push(resolved);
     newResolvedSinceRetrain++;
+
+    // Push outcome to canister
+    if (signal.id) {
+      pushOutcomeToCanister(signal.id, outcome === 'Win').catch(() => {});
+    }
   }
 
   paperSignalsBuffer = stillPending;
@@ -284,6 +408,11 @@ async function runCollection() {
         historyCache.data.pairs[pair] = candleStore.pairs[pair].slice(-5000);
         historyCache.fetchedAt = Date.now();
         incrementCallCount();
+
+        // Push latest 100 candles to canister after each history fetch
+        const latest100 = candleStore.pairs[pair].slice(-100);
+        pushCandlesToCanister(pair, latest100).catch(() => {});
+
       } catch (err) { lastCollectionError = `${pair} history: ${err.message}`; console.error(`[collection] History fetch failed for ${pair}:`, err.message); }
     }
     try {
@@ -600,7 +729,9 @@ async function runSMCEvaluation() {
 
       const classification = smcEngine.classifySignal(trinity, true, killzone);
       const now = new Date();
+      const signalId = `${pair}-${now.getTime()}`;
       const signalBase = {
+        id: signalId,
         pair, direction: candidateDirection, confidence: adjustedConfidence,
         orderBlockPresent: trinity.orderBlockPresent === true,
         fvgPresent: trinity.fvgPresent === true,
@@ -633,19 +764,23 @@ async function runSMCEvaluation() {
           const ps = { ...signalBase, ensembleScore, isPaper: true, paperReason: 'ENSEMBLE_LOW_SCORE' };
           if (paperSignalsBuffer.length >= PAPER_SIGNALS_MAX) paperSignalsBuffer.shift();
           paperSignalsBuffer.push(ps);
+          pushSignalToCanister(ps).catch(() => {});
         } else {
           lastHolyTrinityAt[pair] = now;
           console.log(`[SMC] LIVE signal: ${pair} ${candidateDirection} conf=${adjustedConfidence} ensemble=${ensembleScore ?? 'N/A'}`);
+          pushSignalToCanister({ ...signalBase, ensembleScore, isPaper: false }).catch(() => {});
         }
       } else if (classification === 'PAPER_OUTSIDE_KILLZONE' || classification === 'PAPER_INDICATOR_FAILED') {
         const ps = { ...signalBase, ensembleScore: null, isPaper: true, paperReason: classification };
         if (paperSignalsBuffer.length >= PAPER_SIGNALS_MAX) paperSignalsBuffer.shift();
         paperSignalsBuffer.push(ps);
+        pushSignalToCanister(ps).catch(() => {});
       } else if (classification === 'STANDARD') {
         if (ensembleScore !== null && ensembleScore < 40) {
           const ps = { ...signalBase, confidence: Math.min(70, adjustedConfidence), ensembleScore, isPaper: true, paperReason: 'ENSEMBLE_LOW_SCORE' };
           if (paperSignalsBuffer.length >= PAPER_SIGNALS_MAX) paperSignalsBuffer.shift();
           paperSignalsBuffer.push(ps);
+          pushSignalToCanister(ps).catch(() => {});
         }
       }
     } catch (err) { console.error(`[SMC] Error for ${pair}:`, err.message); }
@@ -676,7 +811,8 @@ app.get('/status', (req, res) => {
     calendarEvents: calendarCache.data.length,
     backfillStatus, backfillPairsComplete, backfillPairsTotal: FOREX_PAIRS.length, backfillTotalCandles,
     intelligenceStatus, intelligenceLastCalculated,
-    lastCollectionError: lastCollectionError || null
+    lastCollectionError: lastCollectionError || null,
+    canisterConnected: !!(CANISTER_HOST && CANISTER_ID && PROXY_IDENTITY_KEY)
   });
 });
 app.get('/health', (req, res) => {
@@ -731,6 +867,7 @@ app.get('/ensemble-status', (req, res) => {
 // --- Start ---
 app.listen(PORT, async () => {
   console.log(`[${new Date().toISOString()}] ForexMind proxy on port ${PORT}`);
+  console.log(`[startup] Canister connected: ${!!(CANISTER_HOST && CANISTER_ID && PROXY_IDENTITY_KEY)}`);
   try { fs.mkdirSync('/data', { recursive: true }); } catch (_) {}
 
   await restoreFromCanister();
@@ -758,8 +895,6 @@ app.listen(PORT, async () => {
   setInterval(() => calculateIntelligenceProfile(), 7 * 24 * 60 * 60 * 1000);
 
   setTimeout(async () => {
-    const CANISTER_HOST = process.env.CANISTER_HOST || null;
-    const CANISTER_ID = process.env.CANISTER_ID || null;
     let allSignals = [];
 
     if (resolvedSignalsBuffer.length >= 100) {
