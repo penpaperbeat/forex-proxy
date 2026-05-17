@@ -23,6 +23,11 @@ const MASSIVE_TICKER_MAP = {
   'USD/CHF': 'C:USDCHF', 'AUD/USD': 'C:AUDUSD', 'USD/CAD': 'C:USDCAD', 'NZD/USD': 'C:NZDUSD'
 };
 
+const COUNTRY_TO_CURRENCY = {
+  'US': 'USD', 'EU': 'EUR', 'DE': 'EUR', 'FR': 'EUR', 'IT': 'EUR', 'ES': 'EUR',
+  'GB': 'GBP', 'JP': 'JPY', 'CH': 'CHF', 'AU': 'AUD', 'CA': 'CAD', 'NZ': 'NZD'
+};
+
 const CANDLE_STORE_PATH = '/data/candle-store.json';
 const BACKFILL_PROGRESS_PATH = '/data/backfill-progress.json';
 const INTELLIGENCE_PROFILE_PATH = '/data/intelligence-profile.json';
@@ -60,15 +65,13 @@ function incrementCallCount() {
   dailyCallCount++;
 }
 
-// FIX #7: CORS locked to configured origin
 function cors(res) {
   res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
   res.setHeader('Vary', 'Origin');
 }
 
-// FIX #6: Auth check for sensitive endpoints
 function requireAuth(req, res) {
-  if (!PROXY_SECRET) return true; // auth disabled if no secret set
+  if (!PROXY_SECRET) return true;
   const key = req.headers['x-forexmind-key'];
   if (key !== PROXY_SECRET) {
     res.status(401).json({ error: 'Unauthorized' });
@@ -108,7 +111,7 @@ try {
   }
 } catch (err) { console.error('[startup] Failed to load intelligence profile:', err.message); }
 
-// FIX #5: Load resolved signals from disk on startup
+// --- Load resolved signals from disk on startup ---
 try {
   if (fs.existsSync(RESOLVED_SIGNALS_PATH)) {
     const raw = fs.readFileSync(RESOLVED_SIGNALS_PATH, 'utf8');
@@ -185,10 +188,10 @@ function calculateRSI(candles, period = 14) {
   return rsi;
 }
 
-// FIX #5: Resolve signals older than 24 candles and record outcome
+// --- Resolve old signals and record outcomes ---
 function resolveOldSignals() {
   const now = Date.now();
-  const RESOLUTION_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 hours
+  const RESOLUTION_WINDOW_MS = 24 * 60 * 60 * 1000;
   const stillPending = [];
 
   for (const signal of paperSignalsBuffer) {
@@ -196,7 +199,6 @@ function resolveOldSignals() {
     const age = now - new Date(signal.generatedAt).getTime();
     if (age < RESOLUTION_WINDOW_MS) { stillPending.push(signal); continue; }
 
-    // Resolve: check if price moved in signal direction
     const candles = candleStore.pairs[signal.pair];
     if (!candles || candles.length < 2) { stillPending.push(signal); continue; }
 
@@ -220,12 +222,10 @@ function resolveOldSignals() {
 
   paperSignalsBuffer = stillPending;
 
-  // Persist resolved signals
   if (newResolvedSinceRetrain > 0) {
     try { fs.writeFileSync(RESOLVED_SIGNALS_PATH, JSON.stringify(resolvedSignalsBuffer.slice(-2000)), 'utf8'); } catch (_) {}
   }
 
-  // Retrain ensemble when 50+ new resolved signals accumulate
   if (newResolvedSinceRetrain >= 50 && resolvedSignalsBuffer.length >= 100) {
     console.log(`[ensemble] Retraining on ${resolvedSignalsBuffer.length} resolved signals...`);
     const trainingData = resolvedSignalsBuffer.map(s => ({
@@ -292,7 +292,6 @@ async function runCollection() {
     } catch (err) { lastCollectionError = `File write failed: ${err.message}`; }
   }
 
-  // FIX #5: resolve old signals on each cycle
   resolveOldSignals();
 }
 
@@ -314,15 +313,26 @@ async function fetchCalendar() {
         15000, 'fetchCalendar finnhub'
       );
       const events = (response.data.economicCalendar || [])
-        .filter(e => (e.impact || '').toLowerCase() === 'high' && RELEVANT_CURRENCIES.includes((e.country || '').toUpperCase()))
-        .map(e => ({ time: e.time, currency: e.country, event: e.event, impact: e.impact, forecast: e.estimate || null, previous: e.prev || null }));
+        .filter(e => {
+          const impact = (e.impact || '').toLowerCase();
+          const currency = COUNTRY_TO_CURRENCY[e.country] || null;
+          return impact === 'high' && currency && RELEVANT_CURRENCIES.includes(currency);
+        })
+        .map(e => ({
+          time: e.time,
+          currency: COUNTRY_TO_CURRENCY[e.country],
+          event: e.event,
+          impact: e.impact,
+          forecast: e.estimate || null,
+          previous: e.prev || null
+        }));
       calendarCache = { data: events, fetchedAt: Date.now() };
       console.log(`[calendar] Finnhub: ${events.length} high-impact events.`);
       return;
     } catch (err) { console.error('[calendar] Finnhub failed:', err.message); }
   }
 
-  // FIX #8: ForexFactory RSS regex corrected to match real format
+  // Fallback: ForexFactory RSS
   try {
     const rssResponse = await withTimeout(
       axios.get('https://nfs.faireconomy.media/ff_calendar_thisweek.xml', { timeout: 10000 }),
@@ -353,7 +363,7 @@ async function fetchCalendar() {
   } catch (err) { console.error('[calendar] ForexFactory RSS fallback failed:', err.message); }
 }
 
-// --- Massive.com backfill (FIX #2: iterative not recursive, FIX #1: counter fix, FIX #4: chunksFailed reset per pair) ---
+// --- Massive.com backfill ---
 async function runMassiveBackfill() {
   let remainingPairs = [...FOREX_PAIRS];
   let pass = 0;
@@ -394,11 +404,8 @@ async function runMassiveBackfill() {
 
     for (const pair of remainingPairs) {
       if (progress[pair] === 'complete') {
-        // FIX #1: count candles from already-complete pairs toward total
-        if (!backfillPairsComplete || pass === 1) {
-          backfillPairsComplete++;
-          backfillTotalCandles += (candleStore.pairs[pair] || []).length;
-        }
+        backfillPairsComplete++;
+        backfillTotalCandles += (candleStore.pairs[pair] || []).length;
         continue;
       }
 
@@ -407,7 +414,6 @@ async function runMassiveBackfill() {
 
       console.log(`[backfill] Starting ${pair}...`);
       let pairCandles = [];
-      // FIX #4: chunksFailed resets per pair (declared here, inside pair loop)
       let chunksFailed = 0;
       let pairAborted = false;
 
@@ -439,7 +445,6 @@ async function runMassiveBackfill() {
             if (nextUrl) await new Promise(r => setTimeout(r, 200));
           }
 
-          // FIX #4: reset consecutive failure count on success
           chunksFailed = 0;
           await new Promise(r => setTimeout(r, 12000));
 
@@ -471,7 +476,6 @@ async function runMassiveBackfill() {
       for (const c of pairCandles) mapByDt[c.datetime] = c;
       candleStore.pairs[pair] = Object.values(mapByDt).sort((a, b) => a.datetime < b.datetime ? -1 : 1);
 
-      // FIX #1: increment counter with actual candle count
       backfillTotalCandles += pairCandles.length;
       historyCache.data.pairs[pair] = candleStore.pairs[pair].slice(-5000);
 
@@ -492,23 +496,20 @@ async function runMassiveBackfill() {
     }
   }
 
-  backfillStatus = FOREX_PAIRS.every(p => {
+  backfillStatus = (() => {
     let prog = {};
     try { prog = JSON.parse(fs.readFileSync(BACKFILL_PROGRESS_PATH, 'utf8')); } catch (_) {}
-    return prog[p] === 'complete';
-  }) ? 'complete' : 'partial';
+    return FOREX_PAIRS.every(p => prog[p] === 'complete') ? 'complete' : 'partial';
+  })();
 
   console.log(`[backfill] Done. Status: ${backfillStatus}. Total candles: ${backfillTotalCandles}`);
-
-  // FIX #3: only schedule intelligence if we have enough data
   scheduleIntelligenceIfReady();
 }
 
-// FIX #3: smart intelligence scheduling
 function scheduleIntelligenceIfReady() {
   const totalCandles = FOREX_PAIRS.reduce((sum, p) => sum + (candleStore.pairs[p] || []).length, 0);
   if (totalCandles < 200 * FOREX_PAIRS.length) {
-    console.log(`[intelligence] Not enough candles (${totalCandles}) to calculate profile. Will retry in 1h.`);
+    console.log(`[intelligence] Not enough candles (${totalCandles}). Retrying in 1h.`);
     setTimeout(scheduleIntelligenceIfReady, 60 * 60 * 1000);
     return;
   }
@@ -591,7 +592,6 @@ async function runSMCEvaluation() {
         : Math.min(100, Math.round(60 + (lastRSI - overbought) * 2));
       const adjustedConfidence = Math.max(0, rawConfidence - dxyPenalty);
 
-      // FIX #12: ensure signalTypeKey never uses undefined values
       const signalTypeKey = smcEngine.computeSignalTypeKey({
         orderBlockPresent: trinity.orderBlockPresent === true,
         fvgPresent: trinity.fvgPresent === true,
@@ -620,7 +620,6 @@ async function runSMCEvaluation() {
           const score = await ensembleScorer.scoreSignal(features);
           if (score !== null) ensembleScore = score;
         } catch (ensErr) {
-          // FIX #13: log ensemble errors instead of swallowing silently
           console.warn(`[ensemble] Scoring failed for ${pair}:`, ensErr.message);
         }
       }
@@ -651,7 +650,6 @@ async function runSMCEvaluation() {
 
 // --- Routes ---
 
-// Public routes
 app.get('/rates', (req, res) => { cors(res); res.json(ratesCache.data); });
 app.get('/history', (req, res) => { cors(res); res.json(historyCache.data); });
 app.get('/calendar', (req, res) => {
@@ -689,8 +687,6 @@ app.get('/stored-history', (req, res) => {
   for (const pair of Object.keys(candleStore.pairs)) limited.pairs[pair] = candleStore.pairs[pair].slice(-limit);
   return res.json(limited);
 });
-
-// FIX #6: Protected routes require X-ForexMind-Key header
 app.get('/paper-signals', (req, res) => {
   cors(res);
   if (!requireAuth(req, res)) return;
@@ -751,28 +747,23 @@ app.listen(PORT, async () => {
 
   setImmediate(() => runMassiveBackfill());
 
-  // FIX #3: intelligence only scheduled from backfill completion or if data already present
   const existingCandles = FOREX_PAIRS.reduce((sum, p) => sum + (candleStore.pairs[p] || []).length, 0);
   if (existingCandles >= 200 * FOREX_PAIRS.length && !intelligenceProfile) {
     setTimeout(() => calculateIntelligenceProfile(), 2 * 60 * 1000);
   }
   setInterval(() => calculateIntelligenceProfile(), 7 * 24 * 60 * 60 * 1000);
 
-  // Load resolved signals into ensemble scorer on startup
   setTimeout(async () => {
     const CANISTER_HOST = process.env.CANISTER_HOST || null;
     const CANISTER_ID = process.env.CANISTER_ID || null;
-
     let allSignals = [];
 
-    // First use local resolved signals
     if (resolvedSignalsBuffer.length >= 100) {
       allSignals = resolvedSignalsBuffer.map(s => ({
         features: ensembleScorer.extractFeatures(s, null), outcome: s.outcome === 'Win'
       }));
     }
 
-    // Then supplement from canister if available
     if (CANISTER_HOST && CANISTER_ID) {
       let page = 0, done = false;
       while (!done) {
