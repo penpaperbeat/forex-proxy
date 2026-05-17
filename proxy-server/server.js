@@ -345,7 +345,7 @@ app.listen(PORT, () => {
   smcEngine.fetchDXYData().then(data => { currentDXYBias = smcEngine.calculateDXYTrend(data); dxyLastFetchedAt = new Date().toISOString(); console.log(`[DXY] Initial trend: ${currentDXYBias}`); }).catch(err => console.warn('[DXY] Initial fetch failed:', err.message));
   fetchCalendar(); setInterval(fetchCalendar, CALENDAR_CACHE_TTL);
   setImmediate(() => runDukascopyBackfill());
-  setTimeout(() => calculateIntelligenceProfile(), 2 * 60 * 1000); setInterval(() => calculateIntelligenceProfile(), 30 * 24 * 60 * 60 * 1000);
+  setTimeout(() => calculateIntelligenceProfile(), 2 * 60 * 1000); setInterval(() => calculateIntelligenceProfile(), 7 * 24 * 60 * 60 * 1000);
   setTimeout(async () => {
     const CANISTER_HOST = process.env.CANISTER_HOST || null, CANISTER_ID = process.env.CANISTER_ID || null;
     if (!CANISTER_HOST || !CANISTER_ID) { console.log('[Ensemble] CANISTER_HOST or CANISTER_ID not set. Skipping training fetch.'); return; }
