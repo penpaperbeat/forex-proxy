@@ -696,6 +696,13 @@ async function runSMCEvaluation() {
   const killzone = smcEngine.isInsideKillzone();
   for (const pair of FOREX_PAIRS) {
     try {
+      // FIX #7: per-pair volatility suppression — only skip the affected pair, not all pairs
+      const { suppressed, reason } = smcEngine.isVolatilitySuppressed(pair, intelligenceProfile);
+      if (suppressed) {
+        console.log(`[SMC] ${reason}`);
+        continue;
+      }
+
       const candles = candleStore.pairs[pair]; if (!candles || candles.length < 50) continue;
       const rsiVals = calculateRSI(candles, 14), lastRSI = rsiVals[rsiVals.length - 1]; if (isNaN(lastRSI)) continue;
       const pairProfile = intelligenceProfile && intelligenceProfile[pair];
@@ -887,7 +894,8 @@ app.listen(PORT, async () => {
   if (existingCandles >= 200 * FOREX_PAIRS.length && !intelligenceProfile) {
     setTimeout(() => calculateIntelligenceProfile(), 2 * 60 * 1000);
   }
-  setInterval(() => calculateIntelligenceProfile(), 7 * 24 * 60 * 60 * 1000);
+  // FIX #7: use INTELLIGENCE_RECALC_INTERVAL_MS from smcEngine (6 hours) instead of hardcoded 7 days
+  setInterval(() => calculateIntelligenceProfile(), smcEngine.INTELLIGENCE_RECALC_INTERVAL_MS);
 
   setTimeout(async () => {
     let allSignals = [];
