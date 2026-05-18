@@ -34,8 +34,8 @@ const state = {
 // Retrain thresholds
 const RETRAIN_DAYS         = 7;
 const RETRAIN_NEW_SIGNALS  = 50;
-let   signalsSinceRetrain  = 0;
 let   newResolvedSinceTrain = 0;
+let   retrainCounter = 0;
 
 // ---------------------------------------------------------------------------
 // Worker management
@@ -106,7 +106,7 @@ function spawnWorker() {
  * paperTypeStats: Map<number, { wins: number, total: number }> or null
  * Returns 13-element number[]
  */
-function extractFeatures(signal, paperTypeStats) {
+function extractFeatures(signal, paperTypeStats, sweepAge) {
   const hour   = signal.generatedAt ? new Date(signal.generatedAt).getUTCHours() : 12;
   const dow    = signal.generatedAt ? new Date(signal.generatedAt).getUTCDay()   : 2;
   // day 0=Sun,6=Sat — clamp to weekday 0-4 (Mon=0)
@@ -149,8 +149,8 @@ function extractFeatures(signal, paperTypeStats) {
     fvgSizePips     = Math.min(50, fvgRange / pipFactor);
   }
 
-  // [feature 6] Candles since sweep (default 5 = not recent)
-  const candlesSinceSweep = 5;
+  // [feature 6] Candles since sweep — use sweepAge if provided, else default 5
+  const candlesSinceSweep = sweepAge !== undefined ? sweepAge : 5;
 
   // [feature 3] ATR percentile from confidence proxy (0-1): confidence is 60-100, map to 0-1
   const atrPercentile = Math.max(0, Math.min(1, ((signal.confidence || 60) - 60) / 40));
@@ -283,12 +283,17 @@ function retrainIfNeeded(resolvedSignals) {
  * Returns status object for the /ensemble-status endpoint.
  */
 function getEnsembleStatus() {
+  const nextRetrainAt = state.modelTrained && state.lastTrainedAt
+    ? new Date(new Date(state.lastTrainedAt).getTime() + 7 * 24 * 60 * 60 * 1000).toISOString()
+    : 'Pending minimum samples (need 100 resolved signals)';
   return {
-    modelTrained:        state.modelTrained,
-    lastTrainedAt:       state.lastTrainedAt,
-    resolvedSignalCount: state.resolvedSignalCount,
-    trainingSampleCount: state.trainingSampleCount,
-    oosAccuracy:         state.oosAccuracy
+    modelTrained:          state.modelTrained,
+    lastTrainedAt:         state.lastTrainedAt,
+    resolvedSignalCount:   state.resolvedSignalCount,
+    trainingSampleCount:   state.trainingSampleCount,
+    oosAccuracy:           state.oosAccuracy,
+    newResolvedSinceTrain: newResolvedSinceTrain,
+    nextRetrainAt:         nextRetrainAt
   };
 }
 
