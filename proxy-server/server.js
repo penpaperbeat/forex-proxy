@@ -362,9 +362,8 @@ async function runCollection() {
   const now = Date.now();
   if (now - lastCandlePushTime >= CANDLE_PUSH_INTERVAL_MS) {
     lastCandlePushTime = now;
-    // Wire canister push here when ready. Example:
-    // pushCandlesToCanister(candleStore).catch(err => console.error('[canister] Candle push failed:', err.message));
-    console.log('[collection] Candle push window reached. Ready for canister sync.');
+    console.log('[collection] Candle push window reached. Starting canister sync.');
+    pushCandlesToCanister(candleStore).catch(err => console.error('[canister] Candle push failed:', err.message));
   }
 }
 
@@ -938,8 +937,8 @@ async function runSMCEvaluation() {
             isPaper: false // explicit: not paper
           };
           console.log(`[SMC] LIVE signal: ${pair} ${candidateDirection} (confidence ${adjustedConfidence}, typeKey ${signalTypeKey}, ensemble ${ensembleScore !== null ? ensembleScore : 'N/A'})`);
-          // TODO: push liveSignal to canister when pushSignal endpoint is wired
           // NOTE: Only LIVE and STANDARD signals go to canister. Paper signals NEVER go to canister.
+          pushSignalToCanister(liveSignal);
         }
 
       } else if (classification === 'PAPER_OUTSIDE_KILLZONE' || classification === 'PAPER_INDICATOR_FAILED') {
@@ -972,7 +971,7 @@ async function runSMCEvaluation() {
             isPaper:       false
           };
           console.log(`[SMC] STANDARD signal: ${pair} ${candidateDirection} (confidence ${standardSignal.confidence}, ensemble ${ensembleScore !== null ? ensembleScore : 'N/A'})`);
-          // TODO: push standardSignal to canister
+          pushSignalToCanister(standardSignal);
         }
       }
 
@@ -1016,11 +1015,69 @@ async function runSMCEvaluation() {
           isFallback:            true
         };
         console.log(`[SMC] FALLBACK signal: ${pair} ${candidateDirection} (24h without Holy Trinity, ensemble ${fallbackEnsembleScore !== null ? fallbackEnsembleScore : 'N/A'})`);
-        // TODO: push fallbackSignal to canister
+        pushSignalToCanister(fallbackSignal);
       }
 
     } catch (err) {
       console.error(`[SMC] Evaluation error for ${pair}:`, err.message);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Canister push helpers — signal and candle push to IC backend
+// ---------------------------------------------------------------------------
+const CANISTER_HOST = process.env.CANISTER_HOST || null;
+const CANISTER_ID   = process.env.CANISTER_ID   || null;
+
+/**
+ * Push a single live signal to the canister via IC HTTP gateway.
+ * Only called for non-paper signals (isPaper === false).
+ * Silently skips if CANISTER_HOST / CANISTER_ID are not configured.
+ */
+async function pushSignalToCanister(signal) {
+  if (!CANISTER_HOST || !CANISTER_ID) return;
+  if (signal.isPaper) return; // safety guard — paper signals never go on-chain
+  try {
+    await axios.post(
+      `${CANISTER_HOST}/api/v1/update`,
+      {
+        canisterId: CANISTER_ID,
+        method:     'storeSignal',
+        args:       [signal]
+      },
+      { timeout: 10000 }
+    );
+    console.log(`[canister] Signal pushed: ${signal.pair} ${signal.direction} (${signal.generatedAt})`);
+  } catch (err) {
+    console.error(`[canister] Signal push failed (${signal.pair} ${signal.direction}):`, err.message);
+  }
+}
+
+/**
+ * Push candle data to the canister, batched per pair (max 500 candles/pair).
+ * Silently skips if CANISTER_HOST / CANISTER_ID are not configured.
+ */
+async function pushCandlesToCanister(store) {
+  if (!CANISTER_HOST || !CANISTER_ID) return;
+  const BATCH_SIZE = 500;
+  const pairs = Object.keys(store.pairs || {});
+  for (const pair of pairs) {
+    const candles = (store.pairs[pair] || []).slice(-BATCH_SIZE);
+    if (candles.length === 0) continue;
+    try {
+      await axios.post(
+        `${CANISTER_HOST}/api/v1/update`,
+        {
+          canisterId: CANISTER_ID,
+          method:     'pushCandles',
+          args:       [pair, candles]
+        },
+        { timeout: 30000 }
+      );
+      console.log(`[canister] Candles pushed: ${pair} (${candles.length} candles)`);
+    } catch (err) {
+      console.error(`[canister] Candle push failed for ${pair}:`, err.message);
     }
   }
 }
