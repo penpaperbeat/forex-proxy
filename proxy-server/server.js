@@ -4,6 +4,9 @@ const express = require('express');
 const axios   = require('axios');
 const fs      = require('fs');
 const crypto  = require('crypto');
+const { HttpAgent, Actor } = require('@dfinity/agent');
+const { IDL } = require('@dfinity/candid');
+const rateLimit = require('express-rate-limit'); // L8
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -13,6 +16,11 @@ const ensembleScorer = require('./ensembleScorer');
 const API_KEY        = process.env.TWELVEDATA_API_KEY;
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
 const PROXY_SECRET   = process.env.PROXY_SECRET || '';
+
+// L9 — warn immediately if PROXY_SECRET is missing
+if (!process.env.PROXY_SECRET) {
+  console.error('CRITICAL WARNING: PROXY_SECRET is not set — all endpoints are unprotected!');
+}
 
 // ---------------------------------------------------------------------------
 // Single source-of-truth for all Forex pairs
@@ -49,6 +57,8 @@ const DUKASCOPY_INSTRUMENTS = {
 const CANDLE_STORE_PATH         = '/data/candle-store.json';
 const BACKFILL_PROGRESS_PATH    = '/data/backfill-progress.json';
 const INTELLIGENCE_PROFILE_PATH = '/data/intelligence-profile.json';
+const PAPER_SIGNALS_PATH        = '/data/paper-signals.json';   // M1
+const RESOLVED_SIGNALS_PATH     = '/data/resolved-signals.json'; // M2
 
 // ---------------------------------------------------------------------------
 // In-memory state
@@ -96,6 +106,59 @@ const CANDLE_PUSH_INTERVAL_MS = parseInt(process.env.CANDLE_PUSH_INTERVAL_MS, 10
 
 // Concurrent collection cycle guard
 let isCollectionRunning = false;
+let collectionStartTime = 0; // M5: safety timeout tracking
+
+// ---------------------------------------------------------------------------
+// @dfinity/agent canister actor setup (C1)
+// ---------------------------------------------------------------------------
+const backendIDL = ({ IDL }) => {
+  const SignalDirection = IDL.Variant({ 'Buy': IDL.Null, 'Sell': IDL.Null });
+  const StoreSignalRequest = IDL.Record({
+    pair:        IDL.Text,
+    direction:   SignalDirection,
+    confidence:  IDL.Float64,
+    timestamp:   IDL.Int,
+    signalType:  IDL.Text,
+    entryPrice:  IDL.Float64,
+    stopLoss:    IDL.Float64,
+    takeProfit:  IDL.Float64,
+  });
+  const CandleRecord = IDL.Record({
+    pair:      IDL.Text,
+    timestamp: IDL.Int,
+    open:      IDL.Float64,
+    high:      IDL.Float64,
+    low:       IDL.Float64,
+    close:     IDL.Float64,
+    volume:    IDL.Float64,
+  });
+  const PushCandlesRequest = IDL.Record({
+    candles: IDL.Vec(CandleRecord),
+    pair:    IDL.Text,
+  });
+  const Result = IDL.Variant({ 'ok': IDL.Text, 'err': IDL.Text });
+  return IDL.Service({
+    storeSignal:         IDL.Func([StoreSignalRequest], [Result], []),
+    pushCandles:         IDL.Func([PushCandlesRequest], [Result], []),
+    getStoredCandlesPage: IDL.Func([IDL.Nat, IDL.Nat], [IDL.Vec(CandleRecord)], ['query']),
+  });
+};
+
+let canisterActor = null;
+
+async function initCanisterActor() {
+  try {
+    const host = process.env.CANISTER_HOST || 'https://ic0.app';
+    const agent = new HttpAgent({ host });
+    canisterActor = Actor.createActor(backendIDL, {
+      agent,
+      canisterId: process.env.CANISTER_ID || 'i5pap-wiaaa-aaaad-agq6q-cai',
+    });
+    console.log('[canister] Actor initialized for canister:', process.env.CANISTER_ID);
+  } catch (e) {
+    console.error('[canister] Failed to initialize actor:', e.message);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Utility helpers
@@ -144,6 +207,32 @@ function cors(res) {
   const origin = process.env.ALLOWED_ORIGIN;
   if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
 }
+// C4 — CORS OPTIONS preflight handler (must come before all routes)
+app.options('*', (req, res) => {
+  const origin = process.env.ALLOWED_ORIGIN;
+  if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST');
+  res.setHeader('Access-Control-Allow-Headers', 'X-ForexMind-Key,Content-Type');
+  res.sendStatus(204);
+});
+
+// M1 — Persist paper signals to /data
+function savePaperSignals() {
+  try {
+    const tmp = PAPER_SIGNALS_PATH + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(paperSignalsBuffer), 'utf8');
+    fs.renameSync(tmp, PAPER_SIGNALS_PATH);
+  } catch (e) { console.error('[persist] paper signals save failed:', e.message); }
+}
+
+// M2 — Persist resolved signals to /data
+function saveResolvedSignals() {
+  try {
+    const tmp = RESOLVED_SIGNALS_PATH + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(resolvedSignalsBuffer), 'utf8');
+    fs.renameSync(tmp, RESOLVED_SIGNALS_PATH);
+  } catch (e) { console.error('[persist] resolved signals save failed:', e.message); }
+}
 
 /**
  * Atomic file write: write to .tmp then rename to prevent corruption on crash.
@@ -186,6 +275,28 @@ try {
   intelligenceProfile = null;
 }
 
+// M1 — Restore paper signals buffer from disk
+try {
+  if (fs.existsSync(PAPER_SIGNALS_PATH)) {
+    paperSignalsBuffer = JSON.parse(fs.readFileSync(PAPER_SIGNALS_PATH, 'utf8'));
+    console.log(`[startup] Paper signals restored from disk (${paperSignalsBuffer.length} signals).`);
+  }
+} catch (err) {
+  console.error('[startup] Failed to restore paper signals:', err.message);
+  paperSignalsBuffer = [];
+}
+
+// M2 — Restore resolved signals buffer from disk
+try {
+  if (fs.existsSync(RESOLVED_SIGNALS_PATH)) {
+    resolvedSignalsBuffer = JSON.parse(fs.readFileSync(RESOLVED_SIGNALS_PATH, 'utf8'));
+    console.log(`[startup] Resolved signals restored from disk (${resolvedSignalsBuffer.length} entries).`);
+  }
+} catch (err) {
+  console.error('[startup] Failed to restore resolved signals:', err.message);
+  resolvedSignalsBuffer = [];
+}
+
 // Warn clearly if MASSIVE_API_KEY is absent
 if (!process.env.MASSIVE_API_KEY) {
   console.warn('[startup] WARNING: MASSIVE_API_KEY not set — backfill will fail with 403');
@@ -201,12 +312,21 @@ function resolveOldSignals() {
     if (sig.resolvedAt || !sig.generatedAt) continue;
     const age = now - new Date(sig.generatedAt).getTime();
     if (age >= 24 * 60 * 60 * 1000) {
-      // Paper signals resolve as informational — no outcome tracking needed
       sig.resolvedAt = new Date().toISOString();
       resolved++;
+      // H2: feed resolved paper signal outcome into resolvedSignalsBuffer for model training
+      const pairIntel = intelligenceProfile && intelligenceProfile[sig.pair];
+      resolvedSignalsBuffer.push({
+        features: ensembleScorer.extractFeatures(sig, pairIntel),
+        outcome:  sig.outcome === 'WIN' ? 1 : 0
+      });
     }
   }
-  if (resolved > 0) console.log(`[resolveOldSignals] Resolved ${resolved} stale paper signals.`);
+  if (resolved > 0) {
+    console.log(`[resolveOldSignals] Resolved ${resolved} stale paper signals.`);
+    saveResolvedSignals();
+    savePaperSignals();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -289,6 +409,15 @@ async function runCollection() {
   // Clear any stale error at the start of each new cycle
   lastCollectionError = null;
 
+  // M3: Record the oldest recent candle timestamp per pair to protect historical data
+  const historicalCutoff = {};
+  for (const pair of FOREX_PAIRS) {
+    const existing = candleStore.pairs[pair];
+    if (existing && existing.length >= 100) {
+      historicalCutoff[pair] = existing[existing.length - 100].datetime;
+    }
+  }
+
   // Fetch rates — 8s stagger between pairs to stay under 8 calls/minute limit
   for (let i = 0; i < FOREX_PAIRS.length; i++) {
     const pair = FOREX_PAIRS[i];
@@ -336,7 +465,11 @@ async function runCollection() {
       if (!candleStore.pairs[pair]) candleStore.pairs[pair] = [];
       const map = {};
       for (const c of candleStore.pairs[pair]) map[c.datetime] = c;
-      for (const c of newCandles)              map[c.datetime] = c;
+      for (const c of newCandles) {
+        // M3: skip candles that would overwrite historical data older than the cutoff
+        if (historicalCutoff[pair] && c.datetime < historicalCutoff[pair]) continue;
+        map[c.datetime] = c;
+      }
       const merged = Object.values(map).sort((a, b) => a.datetime < b.datetime ? -1 : 1);
       candleStore.pairs[pair]       = merged;
       historyCache.data.pairs[pair] = merged.slice(-5000);
@@ -363,7 +496,8 @@ async function runCollection() {
   if (now - lastCandlePushTime >= CANDLE_PUSH_INTERVAL_MS) {
     lastCandlePushTime = now;
     console.log('[collection] Candle push window reached. Starting canister sync.');
-    pushCandlesToCanister(candleStore).catch(err => console.error('[canister] Candle push failed:', err.message));
+    // C3: pass a deep copy snapshot to prevent race condition on mutable candleStore
+    pushCandlesToCanister(JSON.parse(JSON.stringify(candleStore))).catch(err => console.error('[canister] Candle push failed:', err.message));
   }
 }
 
@@ -477,6 +611,12 @@ async function runDukascopyBackfill() {
     if (progress[pair] === 'complete') {
       console.log(`[backfill] ${pair}: already complete, skipping.`);
       backfillPairsComplete++;
+      continue;
+    }
+
+    const existingCount = (candleStore[pair] || []).length;
+    if (existingCount > 10000) {
+      console.log('[backfill]', pair, 'already has', existingCount, 'candles — skipping');
       continue;
     }
 
@@ -844,7 +984,16 @@ async function runSMCEvaluation() {
       if (lastRSI > overbought) candidateDirection = 'SELL';
       if (!candidateDirection) continue;
 
-      const indicatorPassed = true; // RSI bias = indicator confirmation for this pass
+      // H3 — real indicator check: RSI + MACD + ADX from intelligence profile
+      const pairIntel = (typeof intelligenceProfile !== 'undefined' && intelligenceProfile && intelligenceProfile[pair]) || {};
+      const rsiForCheck = pairIntel.rsi || lastRSI || 50;
+      const macdHist = pairIntel.macdHistogram || 0;
+      const adx = pairIntel.adx || 0;
+      const isBuyDir = candidateDirection === 'BUY';
+      const rsiOk   = isBuyDir ? rsiForCheck < 70 : rsiForCheck > 30;
+      const macdOk  = isBuyDir ? macdHist > 0 : macdHist < 0;
+      const adxOk   = adx > 20;
+      const indicatorPassed = rsiOk && macdOk && adxOk;
 
       // ---- SMC detection ----
       const obList     = smcEngine.detectOrderBlocks(candles, candidateDirection);
@@ -1036,21 +1185,28 @@ const CANISTER_ID   = process.env.CANISTER_ID   || null;
  * Silently skips if CANISTER_HOST / CANISTER_ID are not configured.
  */
 async function pushSignalToCanister(signal) {
-  if (!CANISTER_HOST || !CANISTER_ID) return;
+  if (!canisterActor) { console.warn('[canister] Actor not initialized'); return; }
   if (signal.isPaper) return; // safety guard — paper signals never go on-chain
   try {
-    await axios.post(
-      `${CANISTER_HOST}/api/v1/update`,
-      {
-        canisterId: CANISTER_ID,
-        method:     'storeSignal',
-        args:       [signal]
-      },
-      { timeout: 10000 }
-    );
-    console.log(`[canister] Signal pushed: ${signal.pair} ${signal.direction} (${signal.generatedAt})`);
-  } catch (err) {
-    console.error(`[canister] Signal push failed (${signal.pair} ${signal.direction}):`, err.message);
+    const direction = (signal.direction || '').toUpperCase() === 'SELL'
+      ? { 'Sell': null } : { 'Buy': null };
+    const result = await canisterActor.storeSignal({
+      pair:        signal.pair || '',
+      direction,
+      confidence:  signal.confidence || 0,
+      timestamp:   BigInt(Math.floor(signal.timestamp || Date.now())) * 1_000_000n,
+      signalType:  signal.signalType || 'STANDARD',
+      entryPrice:  signal.entryPrice || signal.currentPrice || 0,
+      stopLoss:    signal.stopLoss  || 0,
+      takeProfit:  signal.takeProfit || 0,
+    });
+    if ('ok' in result) {
+      console.log('[canister] Signal pushed:', signal.pair, signal.direction);
+    } else {
+      console.error('[canister] Signal push rejected:', result.err);
+    }
+  } catch (e) {
+    console.error('[canister] Signal push failed:', e.message);
   }
 }
 
@@ -1058,26 +1214,29 @@ async function pushSignalToCanister(signal) {
  * Push candle data to the canister, batched per pair (max 500 candles/pair).
  * Silently skips if CANISTER_HOST / CANISTER_ID are not configured.
  */
-async function pushCandlesToCanister(store) {
-  if (!CANISTER_HOST || !CANISTER_ID) return;
-  const BATCH_SIZE = 500;
-  const pairs = Object.keys(store.pairs || {});
-  for (const pair of pairs) {
-    const candles = (store.pairs[pair] || []).slice(-BATCH_SIZE);
+async function pushCandlesToCanister(candleSnapshot) {
+  if (!canisterActor) { console.warn('[canister] Actor not initialized'); return; }
+  for (const pair of Object.keys(candleSnapshot.pairs || {})) {
+    const candles = candleSnapshot.pairs[pair] || [];
     if (candles.length === 0) continue;
     try {
-      await axios.post(
-        `${CANISTER_HOST}/api/v1/update`,
-        {
-          canisterId: CANISTER_ID,
-          method:     'pushCandles',
-          args:       [pair, candles]
-        },
-        { timeout: 30000 }
-      );
-      console.log(`[canister] Candles pushed: ${pair} (${candles.length} candles)`);
-    } catch (err) {
-      console.error(`[canister] Candle push failed for ${pair}:`, err.message);
+      const candleRecords = candles.slice(-200).map(c => ({
+        pair,
+        timestamp: BigInt(Math.floor(c.timestamp || new Date(c.datetime || 0).getTime())) * 1_000_000n,
+        open:   c.open  || 0,
+        high:   c.high  || 0,
+        low:    c.low   || 0,
+        close:  c.close || 0,
+        volume: c.volume || 0,
+      }));
+      const result = await canisterActor.pushCandles({ candles: candleRecords, pair });
+      if ('ok' in result) {
+        console.log('[canister] Candles pushed:', pair, candleRecords.length);
+      } else {
+        console.error('[canister] Candles push rejected:', pair, result.err);
+      }
+    } catch (e) {
+      console.error('[canister] Candles push failed:', pair, e.message);
     }
   }
 }
@@ -1100,7 +1259,8 @@ function requireSecret(req, res, next) {
 // ---------------------------------------------------------------------------
 // Ensemble status endpoint
 // ---------------------------------------------------------------------------
-app.get('/ensemble-status', (req, res) => {
+// H5 — secured with requireSecret
+app.get('/ensemble-status', requireSecret, (req, res) => {
   cors(res);
   res.json(ensembleScorer.getEnsembleStatus());
 });
@@ -1108,7 +1268,8 @@ app.get('/ensemble-status', (req, res) => {
 // ---------------------------------------------------------------------------
 // Paper signals endpoint
 // ---------------------------------------------------------------------------
-app.get('/paper-signals', (req, res) => {
+// H4 — secured with requireSecret
+app.get('/paper-signals', requireSecret, (req, res) => {
   cors(res);
   const limit = req.query.limit ? parseInt(req.query.limit, 10) : paperSignalsBuffer.length;
   const safe  = isNaN(limit) ? paperSignalsBuffer.length : Math.min(limit, paperSignalsBuffer.length);
@@ -1171,21 +1332,24 @@ app.get('/smc-status', (req, res) => {
   }
 });
 
-app.get('/rates', (req, res) => {
+app.get('/rates', publicLimiter, (req, res) => {
   cors(res);
   res.json(ratesCache.data);
 });
 
-app.get('/history', (req, res) => {
+app.get('/history', publicLimiter, (req, res) => {
   cors(res);
   res.json(historyCache.data);
 });
 
-// /stored-history requires authentication
-app.get('/stored-history', requireSecret, (req, res) => {
+// /stored-history — authenticated + M4 hard limit
+app.get('/stored-history', requireSecret, publicLimiter, (req, res) => {
   cors(res);
-  const limit = req.query.limit ? parseInt(req.query.limit, 10) : null;
-  if (!limit || isNaN(limit)) return res.json(candleStore);
+  const rawLimit = parseInt(req.query.limit, 10);
+  if (req.query.limit !== undefined && (isNaN(rawLimit) || rawLimit <= 0)) {
+    return res.status(400).json({ error: 'Limit must be a positive integer' });
+  }
+  const limit = (rawLimit > 0) ? Math.min(rawLimit, 5000) : 5000;
   const limited = { pairs: {} };
   for (const pair of Object.keys(candleStore.pairs)) {
     limited.pairs[pair] = candleStore.pairs[pair].slice(-limit);
@@ -1193,7 +1357,7 @@ app.get('/stored-history', requireSecret, (req, res) => {
   return res.json(limited);
 });
 
-app.get('/calendar', (req, res) => {
+app.get('/calendar', publicLimiter, (req, res) => {
   cors(res);
   res.json({
     events:    calendarCache.data,
@@ -1219,7 +1383,7 @@ app.get('/intelligence', (req, res) => {
   });
 });
 
-app.get('/status', (req, res) => {
+app.get('/status', publicLimiter, (req, res) => {
   cors(res);
   const storeCounts = {};
   for (const pair of FOREX_PAIRS) {
@@ -1243,7 +1407,7 @@ app.get('/status', (req, res) => {
   });
 });
 
-app.get('/health', (req, res) => {
+app.get('/health', publicLimiter, (req, res) => {
   cors(res);
   res.json({
     status:            'ok',
@@ -1265,9 +1429,17 @@ app.listen(PORT, () => {
   // isCollectionRunning guards against concurrent cycles.
   const runCollectionWithSMC = async () => {
     if (isCollectionRunning) {
-      console.warn('[collection] Cycle already running — skipping this tick.');
-      return;
+      // M5: safety timeout — force reset if stuck > 10 minutes
+      const elapsed = collectionStartTime ? Date.now() - collectionStartTime : 0;
+      if (elapsed > 10 * 60 * 1000) {
+        console.warn('[collection] Safety timeout: force-resetting after', Math.round(elapsed / 1000), 's');
+        isCollectionRunning = false;
+      } else {
+        console.warn('[collection] Cycle already running — skipping this tick.');
+        return;
+      }
     }
+    collectionStartTime = Date.now();
     isCollectionRunning = true;
     try {
       await runCollection();
@@ -1303,13 +1475,22 @@ app.listen(PORT, () => {
   // Resolve any paper signals that passed their 24h window during the previous session
   setTimeout(() => resolveOldSignals(), 5 * 1000);
 
+  // C1 — initialise canister actor on startup
+  initCanisterActor();
+
+  // H1 — retrain ensemble model daily
+  setInterval(() => {
+    try { ensembleScorer.retrainIfNeeded(resolvedSignalsBuffer); }
+    catch (e) { console.error('[ensemble] Retrain interval error:', e.message); }
+  }, 24 * 60 * 60 * 1000);
+
   // Ensemble scorer — attempt to initialise from canister resolved signals after 30s
   setTimeout(async () => {
     try {
-      const CANISTER_HOST = process.env.CANISTER_HOST || null;
-      const CANISTER_ID   = process.env.CANISTER_ID   || null;
+      const _canisterHost = process.env.CANISTER_HOST || null;
+      const _canisterId   = process.env.CANISTER_ID   || null;
 
-      if (!CANISTER_HOST || !CANISTER_ID) {
+      if (!_canisterHost || !_canisterId) {
         console.log('[Ensemble] CANISTER_HOST or CANISTER_ID not set. Skipping initial training fetch.');
         return;
       }
@@ -1325,9 +1506,9 @@ app.listen(PORT, () => {
 
       while (!done) {
         try {
-          const url = `${CANISTER_HOST}/api/v1/query`;
+          const url = `${_canisterHost}/api/v1/query`;
           const resp = await axios.post(url, {
-            canisterId: CANISTER_ID,
+            canisterId: _canisterId,
             method:     'getSignalPage',
             args:       ['ALL', page, PAGE_SIZE]
           }, { timeout: 15000 });
