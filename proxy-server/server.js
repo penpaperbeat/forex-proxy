@@ -93,8 +93,6 @@ function withTimeout(promise, ms, label) {
 }
 
 // --- Canister identity signing ---
-// Signs a request body with the proxy's Ed25519 private key so the canister
-// can verify the caller is the authorized proxy principal.
 function signRequest(body) {
   if (!PROXY_IDENTITY_KEY) return null;
   try {
@@ -156,7 +154,6 @@ async function pushCandlesToCanister(pair, candles) {
   if (!CANISTER_HOST || !CANISTER_ID || !PROXY_IDENTITY_KEY) return;
   if (!candles || candles.length === 0) return;
   try {
-    // Push in batches of 500 to avoid payload size limits
     const BATCH_SIZE = 500;
     for (let i = 0; i < candles.length; i += BATCH_SIZE) {
       const batch = candles.slice(i, i + BATCH_SIZE);
@@ -338,7 +335,6 @@ function resolveOldSignals() {
     resolvedSignalsBuffer.push(resolved);
     newResolvedSinceRetrain++;
 
-    // Push outcome to canister
     if (signal.id) {
       pushOutcomeToCanister(signal.id, outcome === 'Win').catch(() => {});
     }
@@ -366,7 +362,7 @@ async function runCollection() {
   console.log(`[${new Date().toISOString()}] Collection cycle starting...`);
   for (let i = 0; i < FOREX_PAIRS.length; i++) {
     const pair = FOREX_PAIRS[i];
-    if (i > 0) await new Promise(r => setTimeout(r, 2000));
+    if (i > 0) await new Promise(r => setTimeout(r, 8000));
     try {
       const response = await withTimeout(
         axios.get('https://api.twelvedata.com/exchange_rate', {
@@ -388,7 +384,7 @@ async function runCollection() {
     await new Promise(r => setTimeout(r, 2000));
     for (let i = 0; i < FOREX_PAIRS.length; i++) {
       const pair = FOREX_PAIRS[i];
-      if (i > 0) await new Promise(r => setTimeout(r, 2000));
+      if (i > 0) await new Promise(r => setTimeout(r, 8000));
       try {
         const response = await withTimeout(
           axios.get('https://api.twelvedata.com/time_series', {
@@ -409,7 +405,6 @@ async function runCollection() {
         historyCache.fetchedAt = Date.now();
         incrementCallCount();
 
-        // Push latest 100 candles to canister after each history fetch
         const latest100 = candleStore.pairs[pair].slice(-100);
         pushCandlesToCanister(pair, latest100).catch(() => {});
 
