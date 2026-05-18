@@ -5,6 +5,10 @@ const axios = require('axios');
 const MIN_CANDLES = 50;
 const OB_MAX_AGE_CANDLES = 50; // FIX #6: order blocks older than this are stale
 
+// FIX #7: intelligence profile recalculates every 6 hours instead of 7 days
+// Update server.js to use this constant for the recalculation interval
+const INTELLIGENCE_RECALC_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
+
 // --- FIX #1: DST-aware killzone helper ---
 // Returns true if the given UTC date falls inside US DST (second Sunday March → first Sunday November)
 function isUSDST(d) {
@@ -63,6 +67,26 @@ function isInsideKillzone(now) {
 
     return { active: false, killzoneName: null };
   } catch (err) { return { active: false, killzoneName: null }; }
+}
+
+// FIX #7: per-pair volatility suppression
+// Returns { suppressed: boolean, reason: string|null }
+// Only suppresses the specific pair that is extreme — never blocks other pairs
+function isVolatilitySuppressed(pair, intelligenceProfile) {
+  try {
+    if (!intelligenceProfile || !pair) return { suppressed: false, reason: null };
+    const profile = intelligenceProfile[pair];
+    if (!profile) return { suppressed: false, reason: null };
+    if (profile.volatilityRegime === 'extreme') {
+      return {
+        suppressed: true,
+        reason: `${pair} volatility is extreme — signal suppressed for this pair only`
+      };
+    }
+    return { suppressed: false, reason: null };
+  } catch (err) {
+    return { suppressed: false, reason: null };
+  }
 }
 
 // FIX #6: filter order blocks older than OB_MAX_AGE_CANDLES before Trinity evaluation
@@ -137,7 +161,7 @@ function detectLiquiditySweep(candles) {
     if (!candles || candles.length < MIN_CANDLES) return result;
     const len = candles.length, last = candles[len - 1], prev = candles.slice(len - 21, len - 1);
     const lowestLow = Math.min(...prev.map(c => c.low)), highestHigh = Math.max(...prev.map(c => c.high));
-    if (last.low < lowestLow && last.close > lowestLow)   { result.bullishSweep = true; result.sweepCandleIndex = len - 1; }
+    if (last.low < lowestLow && last.close > lowestLow)      { result.bullishSweep = true; result.sweepCandleIndex = len - 1; }
     if (last.high > highestHigh && last.close < highestHigh) { result.bearishSweep = true; result.sweepCandleIndex = len - 1; }
   } catch (err) { console.error('[SMC] detectLiquiditySweep error:', err.message); }
   return result;
@@ -371,10 +395,12 @@ module.exports = {
   getPremiumDiscountZone,
   evaluateHolyTrinity,
   isInsideKillzone,
+  isVolatilitySuppressed,
   fetchDXYData,
   calculateDXYTrend,
   getDXYPenalty,
   computeSignalTypeKey,
   classifySignal,
-  getDXYCache
+  getDXYCache,
+  INTELLIGENCE_RECALC_INTERVAL_MS
 };
