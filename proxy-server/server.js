@@ -219,7 +219,6 @@ try {
 } catch (err) { console.error('[startup] Failed to load candle store:', err.message); candleStore = { pairs: {} }; }
 
 // --- Load intelligence profile from disk on startup ---
-// FIX new-7: if saved profile is older than INTELLIGENCE_RECALC_INTERVAL_MS, trigger immediate recalc
 try {
   if (fs.existsSync(INTELLIGENCE_PROFILE_PATH)) {
     const raw = fs.readFileSync(INTELLIGENCE_PROFILE_PATH, 'utf8');
@@ -702,26 +701,25 @@ async function runSMCEvaluation() {
   } catch (err) { console.error('[SMC] DXY refresh failed:', err.message); }
 
   const killzone = smcEngine.isInsideKillzone();
-  const modelReady = ensembleScorer.getEnsembleStatus().trained === true;
+  // FIX #4+5: was .trained (always undefined) — corrected to .ready
+  const modelReady = ensembleScorer.getEnsembleStatus().ready === true;
 
   for (const pair of FOREX_PAIRS) {
     try {
-      // FIX new-7 (per-pair): only suppress the extreme pair, not all pairs
       const { suppressed, reason } = smcEngine.isVolatilitySuppressed(pair, intelligenceProfile);
       if (suppressed) { console.log(`[SMC] ${reason}`); continue; }
 
       const candles = candleStore.pairs[pair]; if (!candles || candles.length < 50) continue;
       const rsiVals = calculateRSI(candles, 14), lastRSI = rsiVals[rsiVals.length - 1]; if (isNaN(lastRSI)) continue;
       const pairProfile = intelligenceProfile && intelligenceProfile[pair];
-      const oversold  = (pairProfile && pairProfile.adaptiveRSI) ? pairProfile.adaptiveRSI.oversold  : 35;
+      const oversold   = (pairProfile && pairProfile.adaptiveRSI) ? pairProfile.adaptiveRSI.oversold  : 35;
       const overbought = (pairProfile && pairProfile.adaptiveRSI) ? pairProfile.adaptiveRSI.overbought : 65;
 
       let candidateDirection = null;
-      if (lastRSI < oversold)  candidateDirection = 'BUY';
+      if (lastRSI < oversold)   candidateDirection = 'BUY';
       if (lastRSI > overbought) candidateDirection = 'SELL';
       if (!candidateDirection) continue;
 
-      // FIX new-3: make indicatorPassed explicit rather than hardcoded true
       const indicatorPassed = candidateDirection !== null;
 
       const obList      = smcEngine.detectOrderBlocks(candles, candidateDirection);
@@ -737,9 +735,9 @@ async function runSMCEvaluation() {
       const adjustedConfidence = Math.max(0, rawConfidence - dxyPenalty);
 
       const signalTypeKey = smcEngine.computeSignalTypeKey({
-        orderBlockPresent:       trinity.orderBlockPresent      === true,
-        fvgPresent:              trinity.fvgPresent             === true,
-        liquiditySweepPresent:   trinity.liquiditySweepPresent  === true
+        orderBlockPresent:      trinity.orderBlockPresent     === true,
+        fvgPresent:             trinity.fvgPresent            === true,
+        liquiditySweepPresent:  trinity.liquiditySweepPresent === true
       });
 
       const classification = smcEngine.classifySignal(trinity, indicatorPassed, killzone);
@@ -748,9 +746,9 @@ async function runSMCEvaluation() {
       const signalBase = {
         id: signalId,
         pair, direction: candidateDirection, confidence: adjustedConfidence,
-        orderBlockPresent:      trinity.orderBlockPresent      === true,
-        fvgPresent:             trinity.fvgPresent             === true,
-        liquiditySweepPresent:  trinity.liquiditySweepPresent  === true,
+        orderBlockPresent:     trinity.orderBlockPresent     === true,
+        fvgPresent:            trinity.fvgPresent            === true,
+        liquiditySweepPresent: trinity.liquiditySweepPresent === true,
         killzoneActive:  killzone.active,
         killzoneName:    killzone.killzoneName || null,
         dxyBias:         currentDXYBias,
@@ -767,7 +765,7 @@ async function runSMCEvaluation() {
       if ((classification === 'LIVE' || classification === 'STANDARD') && modelReady) {
         try {
           const features = ensembleScorer.extractFeatures(signalBase, null);
-          const score = await ensembleScorer.scoreSignal(features);
+          const score = ensembleScorer.scoreSignal(features); // FIX #3: no longer async, no await needed but await still works
           if (score !== null) ensembleScore = score;
         } catch (ensErr) {
           console.warn(`[ensemble] Scoring failed for ${pair}:`, ensErr.message);
@@ -791,8 +789,6 @@ async function runSMCEvaluation() {
         paperSignalsBuffer.push(ps);
         pushSignalToCanister(ps).catch(() => {});
       } else if (classification === 'STANDARD') {
-        // FIX new-4: always store STANDARD signals as paper when model not yet trained
-        // so they accumulate as training data regardless of ensemble score
         const ps = {
           ...signalBase,
           confidence: Math.min(70, adjustedConfidence),
@@ -921,7 +917,6 @@ app.listen(PORT, async () => {
   if (existingCandles >= 200 * FOREX_PAIRS.length && !intelligenceProfile) {
     setTimeout(() => calculateIntelligenceProfile(), 2 * 60 * 1000);
   }
-  // FIX new-7: use INTELLIGENCE_RECALC_INTERVAL_MS (6 hours) instead of hardcoded 7 days
   setInterval(() => calculateIntelligenceProfile(), smcEngine.INTELLIGENCE_RECALC_INTERVAL_MS);
 
   setTimeout(async () => {
