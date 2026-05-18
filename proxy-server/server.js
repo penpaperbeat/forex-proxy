@@ -219,6 +219,7 @@ try {
 } catch (err) { console.error('[startup] Failed to load candle store:', err.message); candleStore = { pairs: {} }; }
 
 // --- Load intelligence profile from disk on startup ---
+// FIX new-7: if saved profile is older than INTELLIGENCE_RECALC_INTERVAL_MS, trigger immediate recalc
 try {
   if (fs.existsSync(INTELLIGENCE_PROFILE_PATH)) {
     const raw = fs.readFileSync(INTELLIGENCE_PROFILE_PATH, 'utf8');
@@ -226,6 +227,13 @@ try {
     intelligenceStatus = 'active';
     intelligenceLastCalculated = intelligenceProfile._calculatedAt || null;
     console.log('[startup] Intelligence profile loaded.');
+    if (intelligenceLastCalculated) {
+      const age = Date.now() - new Date(intelligenceLastCalculated).getTime();
+      if (age > smcEngine.INTELLIGENCE_RECALC_INTERVAL_MS) {
+        console.log('[startup] Intelligence profile is stale — scheduling immediate recalc.');
+        setTimeout(() => calculateIntelligenceProfile(), 5000);
+      }
+    }
   }
 } catch (err) { console.error('[startup] Failed to load intelligence profile:', err.message); }
 
@@ -694,64 +702,69 @@ async function runSMCEvaluation() {
   } catch (err) { console.error('[SMC] DXY refresh failed:', err.message); }
 
   const killzone = smcEngine.isInsideKillzone();
+  const modelReady = ensembleScorer.getEnsembleStatus().trained === true;
+
   for (const pair of FOREX_PAIRS) {
     try {
-      // FIX #7: per-pair volatility suppression — only skip the affected pair, not all pairs
+      // FIX new-7 (per-pair): only suppress the extreme pair, not all pairs
       const { suppressed, reason } = smcEngine.isVolatilitySuppressed(pair, intelligenceProfile);
-      if (suppressed) {
-        console.log(`[SMC] ${reason}`);
-        continue;
-      }
+      if (suppressed) { console.log(`[SMC] ${reason}`); continue; }
 
       const candles = candleStore.pairs[pair]; if (!candles || candles.length < 50) continue;
       const rsiVals = calculateRSI(candles, 14), lastRSI = rsiVals[rsiVals.length - 1]; if (isNaN(lastRSI)) continue;
       const pairProfile = intelligenceProfile && intelligenceProfile[pair];
-      const oversold = (pairProfile && pairProfile.adaptiveRSI) ? pairProfile.adaptiveRSI.oversold : 35;
+      const oversold  = (pairProfile && pairProfile.adaptiveRSI) ? pairProfile.adaptiveRSI.oversold  : 35;
       const overbought = (pairProfile && pairProfile.adaptiveRSI) ? pairProfile.adaptiveRSI.overbought : 65;
+
       let candidateDirection = null;
-      if (lastRSI < oversold) candidateDirection = 'BUY';
+      if (lastRSI < oversold)  candidateDirection = 'BUY';
       if (lastRSI > overbought) candidateDirection = 'SELL';
       if (!candidateDirection) continue;
-      const obList = smcEngine.detectOrderBlocks(candles, candidateDirection);
-      const fvgList = smcEngine.detectFairValueGaps(candles, candidateDirection);
+
+      // FIX new-3: make indicatorPassed explicit rather than hardcoded true
+      const indicatorPassed = candidateDirection !== null;
+
+      const obList      = smcEngine.detectOrderBlocks(candles, candidateDirection);
+      const fvgList     = smcEngine.detectFairValueGaps(candles, candidateDirection);
       const sweepResult = smcEngine.detectLiquiditySweep(candles);
-      const pdZone = smcEngine.getPremiumDiscountZone(candles);
-      const trinity = smcEngine.evaluateHolyTrinity(candles, candidateDirection, obList, fvgList, sweepResult, pdZone);
-      const dxyPenalty = smcEngine.getDXYPenalty(currentDXYBias, pair, candidateDirection);
+      const pdZone      = smcEngine.getPremiumDiscountZone(candles);
+      const trinity     = smcEngine.evaluateHolyTrinity(candles, candidateDirection, obList, fvgList, sweepResult, pdZone);
+      const dxyPenalty  = smcEngine.getDXYPenalty(currentDXYBias, pair, candidateDirection);
+
       const rawConfidence = candidateDirection === 'BUY'
-        ? Math.min(100, Math.round(60 + (oversold - lastRSI) * 2))
+        ? Math.min(100, Math.round(60 + (oversold  - lastRSI)  * 2))
         : Math.min(100, Math.round(60 + (lastRSI - overbought) * 2));
       const adjustedConfidence = Math.max(0, rawConfidence - dxyPenalty);
 
       const signalTypeKey = smcEngine.computeSignalTypeKey({
-        orderBlockPresent: trinity.orderBlockPresent === true,
-        fvgPresent: trinity.fvgPresent === true,
-        liquiditySweepPresent: trinity.liquiditySweepPresent === true
+        orderBlockPresent:       trinity.orderBlockPresent      === true,
+        fvgPresent:              trinity.fvgPresent             === true,
+        liquiditySweepPresent:   trinity.liquiditySweepPresent  === true
       });
 
-      const classification = smcEngine.classifySignal(trinity, true, killzone);
+      const classification = smcEngine.classifySignal(trinity, indicatorPassed, killzone);
       const now = new Date();
       const signalId = `${pair}-${now.getTime()}`;
       const signalBase = {
         id: signalId,
         pair, direction: candidateDirection, confidence: adjustedConfidence,
-        orderBlockPresent: trinity.orderBlockPresent === true,
-        fvgPresent: trinity.fvgPresent === true,
-        liquiditySweepPresent: trinity.liquiditySweepPresent === true,
-        killzoneActive: killzone.active,
-        killzoneName: killzone.killzoneName || null,
-        dxyBias: currentDXYBias,
-        obZone: trinity.obZone || null,
-        fvgZone: trinity.fvgZone || null,
-        entry:      trinity.entry      || null,
-        stopLoss:   trinity.stopLoss   || null,
-        takeProfit: trinity.takeProfit || null,
-        atr:        trinity.atr        || null,
+        orderBlockPresent:      trinity.orderBlockPresent      === true,
+        fvgPresent:             trinity.fvgPresent             === true,
+        liquiditySweepPresent:  trinity.liquiditySweepPresent  === true,
+        killzoneActive:  killzone.active,
+        killzoneName:    killzone.killzoneName || null,
+        dxyBias:         currentDXYBias,
+        obZone:          trinity.obZone  || null,
+        fvgZone:         trinity.fvgZone || null,
+        entry:           trinity.entry      || null,
+        stopLoss:        trinity.stopLoss   || null,
+        takeProfit:      trinity.takeProfit || null,
+        atr:             trinity.atr        || null,
         ensembleScore: null, signalTypeKey, generatedAt: now.toISOString()
       };
 
       let ensembleScore = null;
-      if (classification === 'LIVE' || classification === 'STANDARD') {
+      if ((classification === 'LIVE' || classification === 'STANDARD') && modelReady) {
         try {
           const features = ensembleScorer.extractFeatures(signalBase, null);
           const score = await ensembleScorer.scoreSignal(features);
@@ -762,7 +775,7 @@ async function runSMCEvaluation() {
       }
 
       if (classification === 'LIVE') {
-        if (ensembleScore !== null && ensembleScore < 40) {
+        if (modelReady && ensembleScore !== null && ensembleScore < 40) {
           const ps = { ...signalBase, ensembleScore, isPaper: true, paperReason: 'ENSEMBLE_LOW_SCORE' };
           if (paperSignalsBuffer.length >= PAPER_SIGNALS_MAX) paperSignalsBuffer.shift();
           paperSignalsBuffer.push(ps);
@@ -778,12 +791,20 @@ async function runSMCEvaluation() {
         paperSignalsBuffer.push(ps);
         pushSignalToCanister(ps).catch(() => {});
       } else if (classification === 'STANDARD') {
-        if (ensembleScore !== null && ensembleScore < 40) {
-          const ps = { ...signalBase, confidence: Math.min(70, adjustedConfidence), ensembleScore, isPaper: true, paperReason: 'ENSEMBLE_LOW_SCORE' };
-          if (paperSignalsBuffer.length >= PAPER_SIGNALS_MAX) paperSignalsBuffer.shift();
-          paperSignalsBuffer.push(ps);
-          pushSignalToCanister(ps).catch(() => {});
-        }
+        // FIX new-4: always store STANDARD signals as paper when model not yet trained
+        // so they accumulate as training data regardless of ensemble score
+        const ps = {
+          ...signalBase,
+          confidence: Math.min(70, adjustedConfidence),
+          ensembleScore: modelReady ? ensembleScore : null,
+          isPaper: true,
+          paperReason: modelReady && ensembleScore !== null && ensembleScore < 40
+            ? 'ENSEMBLE_LOW_SCORE'
+            : 'STANDARD_NO_TRINITY'
+        };
+        if (paperSignalsBuffer.length >= PAPER_SIGNALS_MAX) paperSignalsBuffer.shift();
+        paperSignalsBuffer.push(ps);
+        pushSignalToCanister(ps).catch(() => {});
       }
     } catch (err) { console.error(`[SMC] Error for ${pair}:`, err.message); }
   }
@@ -851,11 +872,17 @@ app.get('/smc-status', (req, res) => {
     for (const pair of FOREX_PAIRS) {
       const candles = candleStore.pairs[pair];
       if (!candles || candles.length < 50) { activePairs[pair] = { activeOBCount: 0, activeFVGCount: 0, lastSweepAge: null, premiumDiscount: 'UNKNOWN' }; continue; }
-      const obs = smcEngine.detectOrderBlocks(candles, 'BUY').length + smcEngine.detectOrderBlocks(candles, 'SELL').length;
+      const obs  = smcEngine.detectOrderBlocks(candles, 'BUY').length + smcEngine.detectOrderBlocks(candles, 'SELL').length;
       const fvgs = smcEngine.detectFairValueGaps(candles, 'BUY').length + smcEngine.detectFairValueGaps(candles, 'SELL').length;
-      const sweep = smcEngine.detectLiquiditySweep(candles);
+      const sweep  = smcEngine.detectLiquiditySweep(candles);
       const pdZone = smcEngine.getPremiumDiscountZone(candles);
-      activePairs[pair] = { activeOBCount: obs, activeFVGCount: fvgs, lastSweepAge: sweep.sweepCandleIndex !== null ? candles.length - 1 - sweep.sweepCandleIndex : null, premiumDiscount: pdZone.isPremium ? 'PREMIUM' : pdZone.isDiscount ? 'DISCOUNT' : 'NEUTRAL' };
+      activePairs[pair] = {
+        activeOBCount: obs, activeFVGCount: fvgs,
+        lastSweepAge: sweep.sweepCandleIndex !== null ? candles.length - 1 - sweep.sweepCandleIndex : null,
+        premiumDiscount: pdZone.isPremium ? 'PREMIUM' : pdZone.isDiscount ? 'DISCOUNT' : 'NEUTRAL',
+        volatilityRegime: intelligenceProfile && intelligenceProfile[pair] ? intelligenceProfile[pair].volatilityRegime : 'unknown',
+        volatilitySuppressed: smcEngine.isVolatilitySuppressed(pair, intelligenceProfile).suppressed
+      };
     }
     res.json({ dxyBias: currentDXYBias, dxyLastFetched: dxyLastFetchedAt, killzoneActive: killzone.active, killzoneName: killzone.killzoneName, activePairs });
   } catch (err) { res.status(500).json({ error: 'SMC status unavailable' }); }
@@ -894,7 +921,7 @@ app.listen(PORT, async () => {
   if (existingCandles >= 200 * FOREX_PAIRS.length && !intelligenceProfile) {
     setTimeout(() => calculateIntelligenceProfile(), 2 * 60 * 1000);
   }
-  // FIX #7: use INTELLIGENCE_RECALC_INTERVAL_MS from smcEngine (6 hours) instead of hardcoded 7 days
+  // FIX new-7: use INTELLIGENCE_RECALC_INTERVAL_MS (6 hours) instead of hardcoded 7 days
   setInterval(() => calculateIntelligenceProfile(), smcEngine.INTELLIGENCE_RECALC_INTERVAL_MS);
 
   setTimeout(async () => {
