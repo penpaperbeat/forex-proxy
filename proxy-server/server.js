@@ -165,7 +165,24 @@ let canisterActor = null;
 async function initCanisterActor() {
   try {
     const host = process.env.CANISTER_HOST || 'https://ic0.app';
-    const agent = new HttpAgent({ host });
+    const { Ed25519KeyIdentity } = require('@dfinity/identity');
+    const hexKey = process.env.PROXY_IDENTITY_KEY;
+    let identity = null;
+    if (hexKey) {
+      try {
+        const seed = Buffer.from(hexKey, 'hex');
+        identity = Ed25519KeyIdentity.fromSecretKey(seed);
+        const principal = identity.getPrincipal().toText();
+        console.log('[canister] Proxy identity loaded. Principal:', principal);
+      } catch (idErr) {
+        console.error('[canister] Failed to load Ed25519 identity from PROXY_IDENTITY_KEY:', idErr.message);
+        identity = null;
+      }
+    } else {
+      console.error('CRITICAL: PROXY_IDENTITY_KEY not set — canister calls will be anonymous and rejected');
+    }
+    const agentOpts = identity ? { host, identity } : { host };
+    const agent = new HttpAgent(agentOpts);
     canisterActor = Actor.createActor(backendIDL, {
       agent,
       canisterId: process.env.CANISTER_ID || 'i5pap-wiaaa-aaaad-agq6q-cai',
