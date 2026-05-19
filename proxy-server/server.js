@@ -170,12 +170,13 @@ async function initCanisterActor() {
     let identity = null;
     if (hexKey) {
       try {
-        const seed = Buffer.from(hexKey, 'hex');
+        const derBuffer = Buffer.from(hexKey, 'hex');
+        const seed = derBuffer.slice(16, 48);
         identity = Ed25519KeyIdentity.fromSecretKey(seed);
         const principal = identity.getPrincipal().toText();
         console.log('[canister] Proxy identity loaded. Principal:', principal);
-      } catch (idErr) {
-        console.error('[canister] Failed to load Ed25519 identity from PROXY_IDENTITY_KEY:', idErr.message);
+      } catch (identityErr) {
+        console.error('[canister] Failed to load proxy identity from PROXY_IDENTITY_KEY:', identityErr.message);
         identity = null;
       }
     } else {
@@ -1561,57 +1562,5 @@ app.listen(PORT, () => {
     catch (e) { console.error('[ensemble] Retrain interval error:', e.message); }
   }, 24 * 60 * 60 * 1000);
 
-  // Ensemble scorer — attempt to initialise from canister resolved signals after 30s
-  setTimeout(async () => {
-    try {
-      const _canisterHost = process.env.CANISTER_HOST || null;
-      const _canisterId   = process.env.CANISTER_ID   || null;
-
-      if (!_canisterHost || !_canisterId) {
-        console.log('[Ensemble] CANISTER_HOST or CANISTER_ID not set. Skipping initial training fetch.');
-        return;
-      }
-
-      // Use configurable base URL for canister queries
-      const PROXY_BASE_URL = process.env.PROXY_BASE_URL || `http://localhost:${PORT}`;
-
-      // Fetch resolved signals from canister via paginated getSignalPage
-      const allSignals = [];
-      const PAGE_SIZE  = 100;
-      let   page       = 0;
-      let   done       = false;
-
-      while (!done) {
-        try {
-          const url = `${_canisterHost}/api/v1/query`;
-          const resp = await axios.post(url, {
-            canisterId: _canisterId,
-            method:     'getSignalPage',
-            args:       ['ALL', page, PAGE_SIZE]
-          }, { timeout: 15000 });
-
-          const signals = (resp.data && Array.isArray(resp.data.result)) ? resp.data.result : [];
-          if (signals.length === 0) { done = true; break; }
-
-          for (const s of signals) {
-            if (s.outcome && s.outcome !== 'Pending') {
-              const outcome  = s.outcome === 'Win';
-              const features = ensembleScorer.extractFeatures(s, null);
-              allSignals.push({ features, outcome });
-            }
-          }
-          if (signals.length < PAGE_SIZE) { done = true; break; }
-          page++;
-        } catch (pageErr) {
-          console.warn(`[Ensemble] Canister page fetch error (page ${page}):`, pageErr.message);
-          done = true;
-        }
-      }
-
-      console.log(`[Ensemble] Fetched ${allSignals.length} resolved signals from canister.`);
-      ensembleScorer.initEnsembleScorer(allSignals);
-    } catch (err) {
-      console.warn('[Ensemble] Startup training fetch failed:', err.message);
-    }
-  }, 30 * 1000);
+  // Ensemble scorer — canister startup fetch disabled (no resolved signals yet)
 });
