@@ -11,7 +11,7 @@
     "@dfinity/candid": "3.3.0",
     "@dfinity/identity": "3.3.0",
     "@dfinity/principal": "3.3.0",
-    "express-rate-limit": "7.5.0"
+    "express-rate-limit": "7.5.0", 
     "dukascopy-node": "1.46.4"
   }
 }
