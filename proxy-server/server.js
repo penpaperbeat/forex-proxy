@@ -1281,17 +1281,36 @@ async function pushSignalToCanister(signal) {
     const smcZones = signal.smcZones || {};
     const obZone  = signal.obZone  || smcZones.orderBlock  || {};
     const fvgZone = signal.fvgZone || smcZones.fvg || {};
+    const _candles = candleStore.pairs[signal.pair];
+    if (!_candles || _candles.length < 15) {
+      console.warn(`[canister] Skipping signal push for ${signal.pair}: insufficient candles for ATR`);
+      return;
+    }
+    const _atrs = calculateATR(_candles, 14);
+    const _atr = _atrs.slice().reverse().find(v => v != null && !isNaN(v)) || 0;
+    if (_atr === 0) {
+      console.warn(`[canister] Skipping signal push for ${signal.pair}: ATR is zero`);
+      return;
+    }
+    const _entry = _candles[_candles.length - 1].close;
+    const _decimals = (_entry.toString().split('.')[1] || '').length || 5;
+    const _round = (v) => parseFloat(v.toFixed(_decimals));
+    const _slDist = 1.5 * _atr;
+    const _tp1Dist = 2.0 * _atr;
+    const _sl = signal.direction === 'BUY' ? _round(_entry - _slDist) : _round(_entry + _slDist);
+    const _tp1 = signal.direction === 'BUY' ? _round(_entry + _tp1Dist) : _round(_entry - _tp1Dist);
+
     const input = {
       pair:                   signal.pair         || '',
       direction,
       confidence:             Math.min(100, Math.max(0, Math.round(signal.confidence || 0))),
       signalTypeKey:          signal.signalTypeKey || 0,
-      entryPrice:             Number(signal.entryPrice  || signal.currentPrice || 0),
-      stopLoss:               Number(signal.stopLoss    || 0),
-      takeProfit1:            Number(signal.takeProfit1 || signal.takeProfit || 0),
-      takeProfit2:            Number(signal.takeProfit2 || signal.takeProfit || 0),
+      entryPrice:             _entry,
+      stopLoss:               _sl,
+      takeProfit1:            _tp1,
+      takeProfit2:            _tp1,
       timestamp:              BigInt(Math.floor((signal.timestamp || Date.now()) * 1_000_000)),
-      sessionAtGeneration:    signal.session     || signal.sessionAtGeneration || '',
+      sessionAtGeneration:    signal.killzoneName || signal.session || signal.sessionAtGeneration || '',
       dxyBias:                signal.dxyBias     || 'UNKNOWN',
       dxyStale:               signal.dxyStale    === true,
       fvgPresent:             signal.fvgPresent   === true,
