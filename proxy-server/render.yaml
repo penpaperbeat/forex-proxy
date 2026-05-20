@@ -1,11 +1,15 @@
 services:
   - type: web
-    name: forex-proxy-server
-    env: node
+    name: forex-proxy
+    runtime: node
     buildCommand: npm install
-    startCommand: node index.js
+    startCommand: node server.js
     envVars:
-      - key: TWELVEDATA_API_KEY
-        sync: false
-      - key: FOREX_PAIRS
-        value: EUR/USD,GBP/USD,USD/JPY,AUD/USD
+      - key: PORT
+        value: 3000
+      - key: DATA_DIR
+        value: /data
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
