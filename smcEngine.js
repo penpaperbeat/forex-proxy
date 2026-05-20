@@ -7,19 +7,19 @@
 // All functions handle edge cases gracefully (too few candles → safe defaults).
 // ---------------------------------------------------------------------------
 
-const axios = require('axios'); // H8: moved to top
+const axios = require('axios');
 
 const MIN_CANDLES = 50;
 
 // ---------------------------------------------------------------------------
-// DST helpers for accurate killzone windows (H6)
+// DST helpers for accurate killzone windows
 // ---------------------------------------------------------------------------
 
 function getNthSundayOfMonth(year, month, n) {
   let count = 0;
   for (let d = 1; d <= 31; d++) {
     const date = new Date(Date.UTC(year, month, d));
-    if (date.getMonth() !== month) break;
+    if (date.getMonth() !== month) break; // overflowed into next month
     if (date.getDay() === 0) { count++; if (count === n) return date; }
   }
   return null;
@@ -35,17 +35,33 @@ function getLastSundayOfMonth(year, month) {
 }
 
 function isUsDst(date) {
-  const y = date.getUTCFullYear();
-  const start = getNthSundayOfMonth(y, 2, 2); // 2nd Sunday of March
+  const y     = date.getUTCFullYear();
+  const start = getNthSundayOfMonth(y, 2, 2);  // 2nd Sunday of March
   const end   = getNthSundayOfMonth(y, 10, 1); // 1st Sunday of November
   return date >= start && date < end;
 }
 
 function isEuDst(date) {
-  const y = date.getUTCFullYear();
+  const y     = date.getUTCFullYear();
   const start = getLastSundayOfMonth(y, 2); // last Sunday of March
   const end   = getLastSundayOfMonth(y, 9); // last Sunday of October
   return date >= start && date < end;
+}
+
+// ---------------------------------------------------------------------------
+// Shared sort helper — candles use datetime (YYYY-MM-DD HH:MM:SS string)
+// ---------------------------------------------------------------------------
+
+/**
+ * ensureAscending(candles)
+ * Returns a copy sorted oldest-first by datetime if out of order.
+ * Uses string comparison — safe for fixed-format datetime strings.
+ */
+function ensureAscending(candles) {
+  if (candles.length > 1 && candles[candles.length - 1].datetime < candles[0].datetime) {
+    return candles.slice().sort((a, b) => a.datetime < b.datetime ? -1 : 1);
+  }
+  return candles;
 }
 
 // ---------------------------------------------------------------------------
@@ -62,34 +78,28 @@ function detectOrderBlocks(candles, direction) {
   try {
     if (!candles || candles.length < MIN_CANDLES) return [];
 
-    // M10: limit to recent 500 candles for performance
-    let workCandles = candles.slice(-500);
-
-    // L11: ensure ascending order
-    if (workCandles.length > 1 && workCandles[workCandles.length - 1].timestamp < workCandles[0].timestamp) {
-      workCandles = workCandles.slice().sort((a, b) => a.timestamp - b.timestamp);
-    }
+    // Limit to recent 500 candles for performance, then ensure ascending order
+    // FIX Bug 1 & 2: work exclusively on workCandles; use datetime (not timestamp) for sort
+    let workCandles = ensureAscending(candles.slice(-500));
 
     const obs = [];
     const len = workCandles.length;
 
     for (let i = 2; i < len; i++) {
-      const c     = candles[i];
-      const prev2 = candles[i - 2];
+      // FIX Bug 1: was candles[i] / candles[i-2] — must be workCandles
+      const c     = workCandles[i];
+      const prev2 = workCandles[i - 2];
 
       if (direction === 'BUY') {
-        // Bullish impulsive move: leaves a bullish FVG (c.low > candles[i-2].high)
-        const hasFVG = c.low > prev2.high;
-        if (!hasFVG) continue;
+        // Bullish impulsive move: leaves a bullish FVG (c.low > prev2.high)
+        if (c.low <= prev2.high) continue;
 
         // Break of structure: close above highest high in the 10 candles before i
-        const lookbackStart = Math.max(0, i - 10);
-        const slice = workCandles.slice(lookbackStart, i);
+        const slice = workCandles.slice(Math.max(0, i - 10), i);
         if (slice.length === 0) continue;
-        const swingHigh = Math.max(...slice.map(x => x.high));
-        if (c.close <= swingHigh) continue;
+        if (c.close <= Math.max(...slice.map(x => x.high))) continue;
 
-        // Find the last bearish candle (close < open) before candle[i]
+        // Find the last bearish candle (close < open) in the 5 candles before i
         let obIdx = -1;
         for (let j = i - 1; j >= Math.max(0, i - 5); j--) {
           if (workCandles[j].close < workCandles[j].open) { obIdx = j; break; }
@@ -97,24 +107,22 @@ function detectOrderBlocks(candles, direction) {
         if (obIdx < 0) continue;
 
         obs.push({
-          low:      workCandles[obIdx].low,
-          high:     workCandles[obIdx].high,
-          midpoint: (workCandles[obIdx].low + workCandles[obIdx].high) / 2,
-          index:    obIdx,
+          low:       workCandles[obIdx].low,
+          high:      workCandles[obIdx].high,
+          midpoint:  (workCandles[obIdx].low + workCandles[obIdx].high) / 2,
+          index:     obIdx,
           direction: 'BUY'
         });
+
       } else {
-        // Bearish impulsive move: leaves a bearish FVG (c.high < candles[i-2].low)
-        const hasFVG = c.high < prev2.low;
-        if (!hasFVG) continue;
+        // Bearish impulsive move: leaves a bearish FVG (c.high < prev2.low)
+        if (c.high >= prev2.low) continue;
 
-        const lookbackStart = Math.max(0, i - 10);
-        const slice = workCandles.slice(lookbackStart, i);
+        const slice = workCandles.slice(Math.max(0, i - 10), i);
         if (slice.length === 0) continue;
-        const swingLow = Math.min(...slice.map(x => x.low));
-        if (c.close >= swingLow) continue;
+        if (c.close >= Math.min(...slice.map(x => x.low))) continue;
 
-        // Find the last bullish candle (close > open) before candle[i]
+        // Find the last bullish candle (close > open) in the 5 candles before i
         let obIdx = -1;
         for (let j = i - 1; j >= Math.max(0, i - 5); j--) {
           if (workCandles[j].close > workCandles[j].open) { obIdx = j; break; }
@@ -122,17 +130,16 @@ function detectOrderBlocks(candles, direction) {
         if (obIdx < 0) continue;
 
         obs.push({
-          low:      workCandles[obIdx].low,
-          high:     workCandles[obIdx].high,
-          midpoint: (workCandles[obIdx].low + workCandles[obIdx].high) / 2,
-          index:    obIdx,
+          low:       workCandles[obIdx].low,
+          high:      workCandles[obIdx].high,
+          midpoint:  (workCandles[obIdx].low + workCandles[obIdx].high) / 2,
+          index:     obIdx,
           direction: 'SELL'
         });
       }
     }
 
-    // Filter out mitigated OBs using a Set of mitigated indices (O(n) not O(n^2))
-    // Build a set of OB indices that have been mitigated by subsequent candles
+    // Filter out mitigated OBs — O(n) via Set, not O(n^2)
     const mitigatedIndices = new Set();
     for (const ob of obs) {
       for (let k = ob.index + 1; k < len; k++) {
@@ -147,12 +154,10 @@ function detectOrderBlocks(candles, direction) {
     const deduped = [];
     for (let i = active.length - 1; i >= 0 && deduped.length < 10; i--) {
       const ob = active[i];
-      if (!seen.has(ob.index)) {
-        seen.add(ob.index);
-        deduped.unshift(ob);
-      }
+      if (!seen.has(ob.index)) { seen.add(ob.index); deduped.unshift(ob); }
     }
     return deduped;
+
   } catch (err) {
     console.error('[SMC] detectOrderBlocks error:', err.message);
     return [];
@@ -169,19 +174,13 @@ function detectFairValueGaps(candles, direction) {
   try {
     if (!candles || candles.length < MIN_CANDLES) return [];
 
-    // M10: limit to recent 500 candles for performance
-    let workCandles = candles.slice(-500);
-
-    // L11: ensure ascending order
-    if (workCandles.length > 1 && workCandles[workCandles.length - 1].timestamp < workCandles[0].timestamp) {
-      workCandles = workCandles.slice().sort((a, b) => a.timestamp - b.timestamp);
-    }
-
+    // FIX Bug 2: use datetime for sort guard via ensureAscending
+    let workCandles = ensureAscending(candles.slice(-500));
     const fvgs = [];
     const len  = workCandles.length;
 
     for (let i = 2; i < len; i++) {
-      const c    = workCandles[i];
+      const c     = workCandles[i];
       const prev2 = workCandles[i - 2];
 
       if (direction === 'BUY') {
@@ -197,18 +196,19 @@ function detectFairValueGaps(candles, direction) {
       }
     }
 
-    // Filter out filled FVGs
+    // FIX Bug 3: FVG is filled when price touches ANY part of the gap, not just the far edge
     const active = fvgs.filter(fvg => {
       for (let k = fvg.index + 1; k < len; k++) {
         const c = workCandles[k];
-        if (fvg.direction === 'BUY'  && c.low  <= fvg.low)  return false; // gap filled
-        if (fvg.direction === 'SELL' && c.high >= fvg.high) return false; // gap filled
+        if (fvg.direction === 'BUY'  && c.low  <= fvg.high) return false; // any touch fills it
+        if (fvg.direction === 'SELL' && c.high >= fvg.low)  return false; // any touch fills it
       }
       return true;
     });
 
     // Return most recent 20
     return active.slice(-20);
+
   } catch (err) {
     console.error('[SMC] detectFairValueGaps error:', err.message);
     return [];
@@ -218,42 +218,37 @@ function detectFairValueGaps(candles, direction) {
 /**
  * detectLiquiditySweep(candles)
  * Returns { bullishSweep, bearishSweep, sweepCandleIndex }
- * Examines only the LAST candle for a sweep of the prior 20 candles' range.
+ * Examines only the LAST candle for a sweep of the prior 5 candles' range.
  */
 function detectLiquiditySweep(candles) {
   const result = { bullishSweep: false, bearishSweep: false, sweepCandleIndex: null };
   try {
     if (!candles || candles.length < MIN_CANDLES) return result;
 
-    // L11: ensure ascending order
-    let workCandles = candles;
-    if (workCandles.length > 1 && workCandles[workCandles.length - 1].timestamp < workCandles[0].timestamp) {
-      workCandles = workCandles.slice().sort((a, b) => a.timestamp - b.timestamp);
-    }
+    // FIX Bug 2 & 6: create a copy and use datetime for sort guard
+    let workCandles = ensureAscending(candles.slice());
 
-    const len  = workCandles.length;
-    const last = workCandles[len - 1];
-    // Look back 5 candles (not 20) for a tighter, more relevant sweep window
+    const len     = workCandles.length;
+    const last    = workCandles[len - 1];
     const lookback = Math.min(5, len - 1);
-    const prev = workCandles.slice(len - 1 - lookback, len - 1);
+    const prev    = workCandles.slice(len - 1 - lookback, len - 1);
     if (prev.length === 0) return result;
 
-    const lows  = prev.map(c => c.low);
-    const highs = prev.map(c => c.high);
-    const lowestLow   = Math.min(...lows);
-    const highestHigh = Math.max(...highs);
+    const lowestLow   = Math.min(...prev.map(c => c.low));
+    const highestHigh = Math.max(...prev.map(c => c.high));
 
     // Bullish sweep: last candle wicks below the lowest low but closes above it
     if (last.low < lowestLow && last.close > lowestLow) {
-      result.bullishSweep    = true;
+      result.bullishSweep     = true;
       result.sweepCandleIndex = len - 1;
     }
 
     // Bearish sweep: last candle wicks above the highest high but closes below it
     if (last.high > highestHigh && last.close < highestHigh) {
-      result.bearishSweep    = true;
+      result.bearishSweep     = true;
       result.sweepCandleIndex = len - 1;
     }
+
   } catch (err) {
     console.error('[SMC] detectLiquiditySweep error:', err.message);
   }
@@ -270,25 +265,23 @@ function getPremiumDiscountZone(candles) {
   try {
     if (!candles || candles.length < MIN_CANDLES) return fallback;
 
-    const window = candles.slice(-50);
-    const windowHighs = window.map(c => c.high);
-    const windowLows  = window.map(c => c.low);
-    if (windowHighs.length === 0 || windowLows.length === 0) return fallback;
-
-    const highestHigh = Math.max(...windowHighs);
-    const lowestLow   = Math.min(...windowLows);
+    const window      = candles.slice(-50);
+    const highestHigh = Math.max(...window.map(c => c.high));
+    const lowestLow   = Math.min(...window.map(c => c.low));
     const range       = highestHigh - lowestLow;
     if (range === 0) return fallback;
 
     const equilibrium  = (highestHigh + lowestLow) / 2;
-    const neutralBand  = range * 0.20; // ±20% of range (designed wide to reduce false signals)
+    // Neutral band = ±20% of range (intentionally wide to reduce false signals)
+    const neutralBand  = range * 0.20;
     const currentPrice = candles[candles.length - 1].close;
 
     const isNeutral  = currentPrice >= (equilibrium - neutralBand) && currentPrice <= (equilibrium + neutralBand);
-    const isDiscount = currentPrice < (equilibrium - neutralBand);
-    const isPremium  = currentPrice > (equilibrium + neutralBand);
+    const isDiscount = currentPrice <  (equilibrium - neutralBand);
+    const isPremium  = currentPrice >  (equilibrium + neutralBand);
 
     return { equilibrium, isPremium, isDiscount, isNeutral };
+
   } catch (err) {
     console.error('[SMC] getPremiumDiscountZone error:', err.message);
     return fallback;
@@ -302,13 +295,13 @@ function getPremiumDiscountZone(candles) {
  */
 function evaluateHolyTrinity(candles, direction, obList, fvgList, sweepResult, pdZone) {
   const fail = (reason, ob = false, fvg = false, sweep = false) => ({
-    holyTrinityPassed:      false,
-    orderBlockPresent:      ob,
-    fvgPresent:             fvg,
-    liquiditySweepPresent:  sweep,
-    obZone:                 null,
-    fvgZone:                null,
-    failReason:             reason
+    holyTrinityPassed:     false,
+    orderBlockPresent:     ob,
+    fvgPresent:            fvg,
+    liquiditySweepPresent: sweep,
+    obZone:                null,
+    fvgZone:               null,
+    failReason:            reason
   });
 
   try {
@@ -316,33 +309,31 @@ function evaluateHolyTrinity(candles, direction, obList, fvgList, sweepResult, p
 
     const currentPrice = candles[candles.length - 1].close;
 
-    // H7: neutral zone check is the FIRST gate, before direction-specific checks
+    // Neutral zone is the FIRST gate — before direction-specific checks
     if (pdZone.isNeutral) return fail('price in neutral zone');
 
     // Premium/discount filter
     if (direction === 'BUY'  && !pdZone.isDiscount) return fail('price not in discount zone');
     if (direction === 'SELL' && !pdZone.isPremium)  return fail('price not in premium zone');
 
-    // 1 — Price inside an active Order Block
+    // Gate 1 — Price inside an active Order Block
     const matchedOB = obList.find(ob => currentPrice >= ob.low && currentPrice <= ob.high);
     if (!matchedOB) return fail('price not inside any active OB', false, false, false);
 
-    // Pip size: M11 — use pair name for correct JPY detection
-    // JPY pairs have prices in the range 100–200; all others < 10
-    const obMidpoint = (matchedOB.low + matchedOB.high) / 2;
-    const pipSize    = obMidpoint > 10 ? 0.01 : 0.0001;
-    const pipBuffer  = 20 * pipSize;
+    // Pip size — JPY pairs price ~100–200, all others < 10.
+    // Safe for all 7 current pairs; latent risk only if exotic pairs (10–99) added later.
+    const pipSize   = matchedOB.midpoint > 10 ? 0.01 : 0.0001;
+    const pipBuffer = 20 * pipSize;
 
-    // 2 — Unfilled FVG within 20 pips of the matched OB zone
+    // Gate 2 — Unfilled FVG within 20 pips of the matched OB zone
     const matchedFVG = fvgList.find(fvg => {
       const fvgMid = (fvg.low + fvg.high) / 2;
-      const obMid  = matchedOB.midpoint;
-      return Math.abs(fvgMid - obMid) <= pipBuffer ||
+      return Math.abs(fvgMid - matchedOB.midpoint) <= pipBuffer ||
              (fvg.low <= matchedOB.high + pipBuffer && fvg.high >= matchedOB.low - pipBuffer);
     });
     if (!matchedFVG) return fail('no FVG within 20 pips of OB', true, false, false);
 
-    // 3 — Liquidity sweep within last 5 candles
+    // Gate 3 — Liquidity sweep in the correct direction
     const sweepOk = direction === 'BUY' ? sweepResult.bullishSweep : sweepResult.bearishSweep;
     if (!sweepOk) return fail('no liquidity sweep of correct direction', true, true, false);
 
@@ -355,6 +346,7 @@ function evaluateHolyTrinity(candles, direction, obList, fvgList, sweepResult, p
       fvgZone:               { low: matchedFVG.low, high: matchedFVG.high },
       failReason:            null
     };
+
   } catch (err) {
     console.error('[SMC] evaluateHolyTrinity error:', err.message);
     return fail('internal error');
@@ -366,40 +358,42 @@ function evaluateHolyTrinity(candles, direction, obList, fvgList, sweepResult, p
 // ---------------------------------------------------------------------------
 
 /**
- * isInsideKillzone()
+ * isInsideKillzone(now?)
  * Returns { active: bool, killzoneName: string | null }
- * All windows are UTC hours, DST-adjusted for accuracy (H6).
+ *
+ * All windows expressed in UTC minutes. DST shifts the UTC equivalent earlier:
+ *   - EU DST active  → London Open/Close windows shift 1 hour earlier in UTC
+ *   - US DST active  → New York Open window shifts 1 hour earlier in UTC
+ * The code correctly reflects this. Asian Open spans midnight and needs no DST adjustment.
  */
 function isInsideKillzone(now) {
   try {
     const d    = now || new Date();
-    const h    = d.getUTCHours();
-    const m    = d.getUTCMinutes();
-    // Express as total minutes since UTC midnight for clean range checks
-    const mins = h * 60 + m;
+    const mins = d.getUTCHours() * 60 + d.getUTCMinutes();
 
     const usDst = isUsDst(d);
     const euDst = isEuDst(d);
 
-    // London Open: base 07:00–09:00 UTC; shifts to 06:00–08:00 when EU DST active
+    // London Open: 07:00–09:00 UTC (winter) / 06:00–08:00 UTC (EU DST)
     const londonOpenStart = euDst ? 6 * 60 : 7 * 60;
     const londonOpenEnd   = euDst ? 8 * 60 : 9 * 60;
     if (mins >= londonOpenStart && mins < londonOpenEnd) return { active: true, killzoneName: 'London Open' };
 
-    // New York Open: base 12:00–14:00 UTC; shifts to 11:00–13:00 when US DST active
+    // New York Open: 12:00–14:00 UTC (winter) / 11:00–13:00 UTC (US DST)
     const nyOpenStart = usDst ? 11 * 60 : 12 * 60;
     const nyOpenEnd   = usDst ? 13 * 60 : 14 * 60;
     if (mins >= nyOpenStart && mins < nyOpenEnd) return { active: true, killzoneName: 'New York Open' };
 
-    // London Close: base 15:00–17:00 UTC; shifts to 14:00–16:00 when EU DST active
+    // London Close: 15:00–17:00 UTC (winter) / 14:00–16:00 UTC (EU DST)
     const londonCloseStart = euDst ? 14 * 60 : 15 * 60;
     const londonCloseEnd   = euDst ? 16 * 60 : 17 * 60;
     if (mins >= londonCloseStart && mins < londonCloseEnd) return { active: true, killzoneName: 'London Close' };
 
-    // Asian Open: 23:00–01:00 UTC (spans midnight) — no DST adjustment needed
+    // Asian Open: 23:00–01:00 UTC — spans midnight, no DST adjustment needed
     if (mins >= 23 * 60 || mins < 1 * 60) return { active: true, killzoneName: 'Asian Open' };
 
     return { active: false, killzoneName: null };
+
   } catch (err) {
     console.error('[SMC] isInsideKillzone error:', err.message);
     return { active: false, killzoneName: null };
@@ -416,8 +410,7 @@ let dxyCache = { data: null, fetchedAt: 0 };
 /**
  * fetchDXYData()
  * Fetches DXY series from dollarliquidity.com. Cached for 6 hours.
- * Returns array of { date, value } or null on failure.
- * H8: axios is now required at the top of the file.
+ * Returns array of { date, value } sorted ascending, or null on failure.
  */
 async function fetchDXYData() {
   try {
@@ -430,25 +423,19 @@ async function fetchDXYData() {
       { timeout: 10000 }
     );
 
-    // API may return array directly or { data: [...] } — handle both shapes
-    let series = null;
+    // API may return array directly or wrapped in various shapes — handle all
     const body = response.data;
-    if (Array.isArray(body)) {
-      series = body;
-    } else if (body && Array.isArray(body.data)) {
-      series = body.data;
-    } else if (body && Array.isArray(body.series)) {
-      series = body.series;
-    } else if (body && Array.isArray(body.values)) {
-      series = body.values;
-    }
+    let series = null;
+    if      (Array.isArray(body))               series = body;
+    else if (body && Array.isArray(body.data))   series = body.data;
+    else if (body && Array.isArray(body.series)) series = body.series;
+    else if (body && Array.isArray(body.values)) series = body.values;
 
     if (!series || series.length === 0) {
-      console.warn('[DXY] Unexpected response shape, treating as null:', JSON.stringify(body).slice(0, 200));
+      console.warn('[DXY] Unexpected response shape:', JSON.stringify(body).slice(0, 200));
       return null;
     }
 
-    // Normalise: ensure each entry has { date, value }
     const normalised = series
       .map(entry => {
         const value = entry.value ?? entry.close ?? entry.price ?? entry.y ?? null;
@@ -460,12 +447,11 @@ async function fetchDXYData() {
 
     if (normalised.length === 0) return null;
 
-    // Sort ascending by date
-    normalised.sort((a, b) => (a.date < b.date ? -1 : 1));
-
+    normalised.sort((a, b) => a.date < b.date ? -1 : 1);
     dxyCache = { data: normalised, fetchedAt: Date.now() };
     console.log(`[DXY] Fetched ${normalised.length} data points.`);
     return normalised;
+
   } catch (err) {
     console.warn('[DXY] fetchDXYData failed:', err.message);
     return null;
@@ -474,12 +460,14 @@ async function fetchDXYData() {
 
 /**
  * calculateEMA(values, period)
- * Standard EMA: k = 2/(n+1)
+ * Standard EMA: k = 2/(n+1).
+ * Returns null if insufficient data.
+ * Note: when values.length === period exactly, returns the seed SMA (correct degenerate case).
  */
 function calculateEMA(values, period) {
   if (!values || values.length < period) return null;
-  const k = 2 / (period + 1);
-  let ema = values.slice(0, period).reduce((s, v) => s + v, 0) / period;
+  const k   = 2 / (period + 1);
+  let ema   = values.slice(0, period).reduce((s, v) => s + v, 0) / period;
   for (let i = period; i < values.length; i++) {
     ema = values[i] * k + ema * (1 - k);
   }
@@ -508,13 +496,13 @@ function calculateDXYTrend(dxyData) {
 
 /**
  * getDXYPenalty(dxyBias, pair, direction)
- * Returns 0 or 20 confidence penalty.
+ * Returns 20 confidence penalty when signal direction opposes DXY trend, else 0.
  */
 function getDXYPenalty(dxyBias, pair, direction) {
   try {
     if (!dxyBias || dxyBias === 'NEUTRAL') return 0;
-    const usdBase    = ['USD/JPY', 'USD/CHF', 'USD/CAD'];  // USD is base currency
-    const usdCounter = ['EUR/USD', 'GBP/USD', 'AUD/USD', 'NZD/USD']; // USD is quote
+    const usdBase    = ['USD/JPY', 'USD/CHF', 'USD/CAD']; // USD is the base currency
+    const usdCounter = ['EUR/USD', 'GBP/USD', 'AUD/USD', 'NZD/USD']; // USD is the quote
 
     if (usdBase.includes(pair)) {
       if (direction === 'BUY'  && dxyBias === 'USD_WEAK')   return 20;
@@ -531,12 +519,12 @@ function getDXYPenalty(dxyBias, pair, direction) {
 }
 
 // ---------------------------------------------------------------------------
-// PART 4 — SIGNAL CLASSIFICATION HELPER
+// PART 4 — SIGNAL CLASSIFICATION HELPERS
 // ---------------------------------------------------------------------------
 
 /**
  * computeSignalTypeKey({ orderBlockPresent, fvgPresent, liquiditySweepPresent })
- * Returns integer 0–7.
+ * Returns integer 0–7 (bitmask).
  */
 function computeSignalTypeKey(smc) {
   const bit0 = smc.orderBlockPresent     ? 1 : 0;
@@ -548,21 +536,26 @@ function computeSignalTypeKey(smc) {
 /**
  * classifySignal(trinityResult, indicatorPassed, killzone)
  * Returns 'LIVE' | 'PAPER_OUTSIDE_KILLZONE' | 'PAPER_INDICATOR_FAILED' | 'STANDARD' | 'FALLBACK'
+ *
+ * FALLBACK = both trinity and indicators failed. server.js intentionally suppresses
+ * these (no signal stored) but logs them for visibility.
  */
 function classifySignal(trinityResult, indicatorPassed, killzone) {
   const trinityPassed = trinityResult && trinityResult.holyTrinityPassed;
-  if (trinityPassed && indicatorPassed && killzone.active) return 'LIVE';
-  if (trinityPassed && indicatorPassed && !killzone.active) return 'PAPER_OUTSIDE_KILLZONE';
-  if (trinityPassed && !indicatorPassed) return 'PAPER_INDICATOR_FAILED';
-  if (!trinityPassed && indicatorPassed) return 'STANDARD';
+  if (trinityPassed && indicatorPassed  && killzone.active)  return 'LIVE';
+  if (trinityPassed && indicatorPassed  && !killzone.active) return 'PAPER_OUTSIDE_KILLZONE';
+  if (trinityPassed && !indicatorPassed)                     return 'PAPER_INDICATOR_FAILED';
+  if (!trinityPassed && indicatorPassed)                     return 'STANDARD';
   return 'FALLBACK';
 }
 
 /**
- * getDXYCache() — expose cache metadata for /smc-status
+ * getDXYCache()
+ * Returns a shallow copy of the DXY cache metadata for /smc-status.
+ * Returns a copy to prevent external mutation of the internal cache.
  */
 function getDXYCache() {
-  return dxyCache;
+  return { data: dxyCache.data, fetchedAt: dxyCache.fetchedAt };
 }
 
 // ---------------------------------------------------------------------------
