@@ -12,6 +12,7 @@ const app  = express();
 app.set('trust proxy', 1);
 const PORT = process.env.PORT || 3000;
 // SMC Engine — Smart Money Concepts detection layer
+const { getHistoricalRates } = require('dukascopy-node');
 const smcEngine      = require('./smcEngine');
 const ensembleScorer = require('./ensembleScorer');
 const API_KEY        = process.env.TWELVEDATA_API_KEY;
@@ -160,6 +161,34 @@ const backendIDL = ({ IDL }) => {
     pushCandles:     IDL.Func([IDL.Text, IDL.Vec(CandleInput)], [IDL.Bool], []),
     // getCandlePage: paginated candle read for proxy restore-from-canister
     getCandlePage:   IDL.Func([IDL.Text, IDL.Nat, IDL.Nat], [IDL.Vec(CandleInput)], ['query']),
+    pushResolvedOutcome: IDL.Func(
+      [IDL.Record({
+        pair: IDL.Text,
+        direction: IDL.Text,
+        entryPrice: IDL.Float64,
+        stopLoss: IDL.Float64,
+        takeProfit: IDL.Float64,
+        result: IDL.Text,
+        confidence: IDL.Float64,
+        timestamp: IDL.Int,
+      })],
+      [IDL.Variant({ ok: IDL.Null, err: IDL.Text })],
+      []
+    ),
+    getResolvedOutcomes: IDL.Func(
+      [],
+      [IDL.Variant({ ok: IDL.Vec(IDL.Record({
+        pair: IDL.Text,
+        direction: IDL.Text,
+        entryPrice: IDL.Float64,
+        stopLoss: IDL.Float64,
+        takeProfit: IDL.Float64,
+        result: IDL.Text,
+        confidence: IDL.Float64,
+        timestamp: IDL.Int,
+      })), err: IDL.Text })],
+      []
+    ),
   });
 };
 
@@ -349,6 +378,50 @@ if (!process.env.MASSIVE_API_KEY) {
   console.warn('[startup] WARNING: MASSIVE_API_KEY not set — backfill will fail with 403');
 }
 
+// Dukascopy is primary candle source (no key required).
+// Twelve Data is the fallback — warn if key is absent so operator knows fallback is unavailable.
+if (!process.env.TWELVEDATA_API_KEY) {
+  console.warn('[config] TWELVEDATA_API_KEY not set — live rates and candle fallback will be unavailable');
+}
+
+// ---------------------------------------------------------------------------
+// Dukascopy normalizer — converts dukascopy-node candle to internal format
+// dukascopy-node returns: { timestamp: <Unix ms>, open, high, low, close, volume }
+// Target format:          { datetime: "YYYY-MM-DD HH:MM:SS", open, high, low, close }
+// ---------------------------------------------------------------------------
+function normalizeDukascopyCandle(entry) {
+  const d = new Date(entry.timestamp);
+  const pad = n => String(n).padStart(2, '0');
+  const datetime = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+  return {
+    datetime,
+    open:   parseFloat(entry.open),
+    high:   parseFloat(entry.high),
+    low:    parseFloat(entry.low),
+    close:  parseFloat(entry.close)
+  };
+}
+
+/**
+ * fetchCandlesDukascopy(pair, fromDate, toDate)
+ * Fetches 15-minute candles from dukascopy-node for a given pair and date range.
+ * Returns normalized candle array (oldest-first) or throws on failure.
+ */
+async function fetchCandlesDukascopy(pair, fromDate, toDate) {
+  const instrument = DUKASCOPY_INSTRUMENTS[pair];
+  if (!instrument) throw new Error(`No Dukascopy instrument mapping for pair: ${pair}`);
+  const raw = await getHistoricalRates({
+    instrument,
+    dates:     { from: fromDate, to: toDate },
+    timeframe: 'm15',
+    format:    'json'
+  });
+  if (!raw || !Array.isArray(raw) || raw.length === 0) {
+    throw new Error(`dukascopy-node returned empty data for ${pair}`);
+  }
+  return raw.map(normalizeDukascopyCandle);
+}
+
 // ---------------------------------------------------------------------------
 // Resolve signals that passed their 24h window since previous session
 // ---------------------------------------------------------------------------
@@ -367,6 +440,16 @@ function resolveOldSignals() {
         features: ensembleScorer.extractFeatures(sig, pairIntel, undefined),
         outcome:  sig.outcome === 'WIN' ? 1 : 0
       });
+      pushResolvedOutcomeToCanister({
+        pair: sig.pair,
+        direction: sig.direction,
+        entryPrice: sig.entryPrice,
+        stopLoss: sig.stopLoss,
+        takeProfit: sig.takeProfit,
+        result: sig.outcome === 'WIN' ? 'TP_HIT' : sig.outcome === 'LOSS' ? 'SL_HIT' : 'EXPIRED',
+        confidence: sig.confidence || 0,
+        timestamp: sig.timestamp ? Math.round(sig.timestamp * 1_000_000) : Date.now() * 1_000_000,
+      }).catch(() => {});
     }
   }
   if (resolved > 0) {
@@ -490,24 +573,57 @@ async function runCollection() {
 
   await new Promise(r => setTimeout(r, 8000));
 
-  // Fetch history — 8s stagger between pairs to stay under 8 calls/minute limit
+  // Fetch candles — Dukascopy primary (free, no limits), Twelve Data fallback
+  // 8s stagger between pairs to be respectful of upstream servers
   for (let i = 0; i < FOREX_PAIRS.length; i++) {
     const pair = FOREX_PAIRS[i];
     if (i > 0) await new Promise(r => setTimeout(r, 8000));
     try {
-      const response = await axios.get('https://api.twelvedata.com/time_series', {
-        params: { symbol: pair, interval: '1h', outputsize: 5000, apikey: API_KEY },
-        timeout: 30000
-      });
-      const newCandles = (response.data.values || [])
-        .map(c => ({
-          datetime: c.datetime,
-          open:  parseFloat(c.open),
-          high:  parseFloat(c.high),
-          low:   parseFloat(c.low),
-          close: parseFloat(c.close)
-        }))
-        .filter(c => !isNaN(c.open) && !isNaN(c.close));
+      // --- Dukascopy primary ---
+      let newCandles = null;
+      try {
+        const toDate   = new Date();
+        const fromDate = new Date(toDate.getTime() - 7 * 24 * 60 * 60 * 1000); // last 7 days
+        newCandles = await fetchCandlesDukascopy(pair, fromDate, toDate);
+        console.log(`[dukascopy] Fetched ${newCandles.length} candles for ${pair}`);
+      } catch (dukErr) {
+        console.warn(`[dukascopy] Failed for ${pair}, falling back to Twelve Data:`, dukErr.message);
+        // --- Twelve Data fallback ---
+        if (process.env.TWELVEDATA_API_KEY) {
+          try {
+            const tdResp = await axios.get('https://api.twelvedata.com/time_series', {
+              params: { symbol: pair, interval: '15min', outputsize: 500, apikey: API_KEY },
+              timeout: 30000
+            });
+            if (tdResp.data && Array.isArray(tdResp.data.values)) {
+              // Twelve Data returns newest-first — reverse to oldest-first
+              newCandles = tdResp.data.values
+                .map(c => ({
+                  datetime: c.datetime,
+                  open:  parseFloat(c.open),
+                  high:  parseFloat(c.high),
+                  low:   parseFloat(c.low),
+                  close: parseFloat(c.close)
+                }))
+                .filter(c => !isNaN(c.open) && !isNaN(c.close))
+                .reverse();
+              console.log(`[twelve-data-fallback] Fetched ${newCandles.length} candles for ${pair}`);
+              incrementCallCount();
+            } else {
+              console.warn(`[twelve-data-fallback] Bad response for ${pair}:`, JSON.stringify(tdResp.data).slice(0, 200));
+            }
+          } catch (tdErr) {
+            console.error(`[twelve-data-fallback] Also failed for ${pair}:`, tdErr.message);
+          }
+        } else {
+          console.warn(`[twelve-data-fallback] TWELVEDATA_API_KEY not set — candle fallback unavailable for ${pair}`);
+        }
+      }
+
+      if (!newCandles || newCandles.length === 0) {
+        console.warn(`[candles] No candles available for ${pair} this cycle, keeping existing data`);
+        continue;
+      }
 
       if (!candleStore.pairs[pair]) candleStore.pairs[pair] = [];
       const map = {};
@@ -521,7 +637,6 @@ async function runCollection() {
       candleStore.pairs[pair]       = merged;
       historyCache.data.pairs[pair] = merged.slice(-5000);
       historyCache.fetchedAt        = Date.now();
-      incrementCallCount();
     } catch (err) {
       lastCollectionError = `${pair} history: ${err.message}`;
       console.error(`[collection] History fetch failed for ${pair}:`, err.message);
@@ -641,14 +756,7 @@ async function runDukascopyBackfill() {
   backfillStatus = 'running';
   console.log('[backfill] Starting Dukascopy 10-year backfill...');
 
-  let getHistoricalRates;
-  try {
-    ({ getHistoricalRates } = require('dukascopy-node'));
-  } catch (err) {
-    backfillStatus = 'error';
-    console.error('[backfill] dukascopy-node not available:', err.message);
-    return;
-  }
+  // getHistoricalRates imported at module level (top of file)
 
   // Load progress checkpoint
   let progress = {};
@@ -1382,6 +1490,63 @@ async function pushCandlesToCanister(candleSnapshot) {
   }
 }
 
+async function pushResolvedOutcomeToCanister(outcome) {
+  if (!canisterActor) return;
+  try {
+    const result = await canisterActor.pushResolvedOutcome({
+      pair: outcome.pair || '',
+      direction: outcome.direction || '',
+      entryPrice: outcome.entryPrice || 0,
+      stopLoss: outcome.stopLoss || 0,
+      takeProfit: outcome.takeProfit || 0,
+      result: outcome.result || 'EXPIRED',
+      confidence: outcome.confidence || 0,
+      timestamp: typeof outcome.timestamp === 'bigint' ? outcome.timestamp : BigInt(Math.round(outcome.timestamp || Date.now() * 1_000_000)),
+    });
+    if (result && result.err) {
+      console.warn('[canister] pushResolvedOutcome rejected:', result.err);
+    } else {
+      console.log('[canister] Pushed resolved outcome:', outcome.pair, outcome.result);
+    }
+  } catch (err) {
+    console.warn('[canister] pushResolvedOutcome failed (non-blocking):', err.message || err);
+  }
+}
+
+async function restoreResolvedOutcomesFromCanister() {
+  if (!canisterActor) return;
+  if (resolvedSignalsBuffer.length >= 100) return;
+  try {
+    const result = await canisterActor.getResolvedOutcomes();
+    if (!result || result.err) {
+      console.warn('[canister] getResolvedOutcomes returned error:', result?.err);
+      return;
+    }
+    const canisterOutcomes = Array.isArray(result.ok) ? result.ok : [];
+    let merged = 0;
+    for (const co of canisterOutcomes) {
+      const key = `${co.pair}:${String(co.timestamp)}`;
+      const alreadyHave = resolvedSignalsBuffer.some(
+        r => r._canisterKey === key
+      );
+      if (!alreadyHave) {
+        resolvedSignalsBuffer.push({
+          features: [0],
+          outcome: co.result === 'TP_HIT',
+          _canisterKey: key,
+        });
+        merged++;
+      }
+    }
+    if (merged > 0) {
+      console.log(`[canister] Restored ${merged} resolved outcomes from canister`);
+      saveResolvedSignals();
+    }
+  } catch (err) {
+    console.warn('[canister] restoreResolvedOutcomesFromCanister failed (non-blocking):', err.message || err);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Rate limiters — L8
 // ---------------------------------------------------------------------------
@@ -1629,7 +1794,8 @@ app.listen(PORT, () => {
   setTimeout(() => resolveOldSignals(), 5 * 1000);
 
   // C1 — initialise canister actor on startup, then seed ensemble scorer from canister
-  initCanisterActor().then(() => {
+  initCanisterActor().then(async () => {
+    await restoreResolvedOutcomesFromCanister();
     // NEW-H6: seed ensemble scorer from resolved signals already in the buffer
     // If resolved signals were restored from disk, init immediately — no cold start
     if (resolvedSignalsBuffer.length >= 100) {
