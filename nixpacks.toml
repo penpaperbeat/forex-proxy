@@ -1,8 +1,0 @@
-[phases.setup]
-nixPkgs = ["nodejs_20"]
-
-[phases.install]
-cmds = ["cd proxy-server && npm install --legacy-peer-deps"]
-
-[start]
-cmd = "node proxy-server/server.js"
