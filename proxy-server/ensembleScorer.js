@@ -101,9 +101,10 @@ function spawnWorker() {
 // ---------------------------------------------------------------------------
 
 /**
- * extractFeatures(signal, paperTypeStats)
+ * extractFeatures(signal, paperTypeStats, sweepAge)
  * signal: object from runSMCEvaluation (signalBase shape)
  * paperTypeStats: Map<number, { wins: number, total: number }> or null
+ * sweepAge: number | undefined — candles since last sweep (from SMC engine, optional)
  * Returns 13-element number[]
  */
 function extractFeatures(signal, paperTypeStats, sweepAge) {
@@ -116,8 +117,10 @@ function extractFeatures(signal, paperTypeStats, sweepAge) {
   const hourCos = Math.cos(2 * Math.PI * hour / 24);
 
   // [feature 8] DXY alignment: USD_STRONG=1, NEUTRAL=0, USD_WEAK=-1
+  // BUG-H10 FIX: use signal.dxyBias (the actual bias from the signal, not a default)
   const dxyMap     = { USD_STRONG: 1, NEUTRAL: 0, USD_WEAK: -1 };
-  const dxyEncoded = dxyMap[signal.dxyBias] !== undefined ? dxyMap[signal.dxyBias] : 0;
+  const dxyBias    = signal.dxyBias || 'NEUTRAL';
+  const dxyEncoded = dxyMap[dxyBias] !== undefined ? dxyMap[dxyBias] : 0;
 
   // [feature 7] Session quality: 1.0 = NY open (best), 0.8 = London open, 0.7 = London close, 0.5 = Asian, 0.3 = other/unknown
   const sessionQualityMap = {
@@ -150,7 +153,8 @@ function extractFeatures(signal, paperTypeStats, sweepAge) {
   }
 
   // [feature 6] Candles since sweep — use sweepAge if provided, else default 5
-  const candlesSinceSweep = sweepAge !== undefined ? sweepAge : 5;
+  // NEW-L3/BUG-L8 FIX: sweepAge is now passed from the SMC engine via extractFeatures(signal, stats, sweepAge)
+  const candlesSinceSweep = (sweepAge !== undefined && sweepAge !== null) ? sweepAge : 5;
 
   // [feature 3] ATR percentile from confidence proxy (0-1): confidence is 60-100, map to 0-1
   const atrPercentile = Math.max(0, Math.min(1, ((signal.confidence || 60) - 60) / 40));
