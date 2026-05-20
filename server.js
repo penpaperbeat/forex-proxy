@@ -1,25 +1,22 @@
 'use strict';
 
-const express   = require('express');
-const axios     = require('axios');
-const fs        = require('fs');
-const crypto    = require('crypto');
+const express = require('express');
+const axios   = require('axios');
+const fs      = require('fs');
+const crypto  = require('crypto');
 const { HttpAgent, Actor } = require('@dfinity/agent');
-const { IDL }   = require('@dfinity/candid');
-const rateLimit = require('express-rate-limit');
+const { IDL } = require('@dfinity/candid');
+const rateLimit = require('express-rate-limit'); // L8
 
-const app = express();
+const app  = express();
 app.set('trust proxy', 1);
-app.use(express.json()); // body parsing for future POST endpoints
 const PORT = process.env.PORT || 3000;
-
 // SMC Engine — Smart Money Concepts detection layer
 const smcEngine      = require('./smcEngine');
 const ensembleScorer = require('./ensembleScorer');
-
-const API_KEY         = process.env.TWELVEDATA_API_KEY;
+const API_KEY        = process.env.TWELVEDATA_API_KEY;
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
-const PROXY_SECRET    = process.env.PROXY_SECRET || '';
+const PROXY_SECRET   = process.env.PROXY_SECRET || '';
 
 // SEC-H3 — warn immediately if PROXY_SECRET is missing; block all authenticated calls
 let _proxySecretMissing = false;
@@ -35,14 +32,37 @@ const FOREX_PAIRS = (process.env.FOREX_PAIRS || 'EUR/USD,GBP/USD,USD/JPY,USD/CHF
   .split(',')
   .map(p => p.trim());
 
+// Bid-to-mid price adjustments (half-spread) per pair
+const BID_TO_MID_ADJUSTMENT = {
+  'EUR/USD': 0.00015,
+  'GBP/USD': 0.00025,
+  'USD/JPY': 0.015,
+  'USD/CHF': 0.00020,
+  'AUD/USD': 0.00020,
+  'USD/CAD': 0.00025,
+  'NZD/USD': 0.00025
+};
+
+// Dukascopy instrument name mapping (no slash, lowercase)
+const DUKASCOPY_INSTRUMENTS = {
+  'EUR/USD': 'eurusd',
+  'GBP/USD': 'gbpusd',
+  'USD/JPY': 'usdjpy',
+  'USD/CHF': 'usdchf',
+  'AUD/USD': 'audusd',
+  'USD/CAD': 'usdcad',
+  'NZD/USD': 'nzdusd'
+};
+
 // ---------------------------------------------------------------------------
-// File paths — ALL use /data (Render persistent volume)
+// File paths — ALL use /data (Railway persistent volume)
 // ---------------------------------------------------------------------------
 const DATA_DIR                  = process.env.DATA_DIR || '/data';
 const CANDLE_STORE_PATH         = `${DATA_DIR}/candle-store.json`;
+const BACKFILL_PROGRESS_PATH    = `${DATA_DIR}/backfill-progress.json`;
 const INTELLIGENCE_PROFILE_PATH = `${DATA_DIR}/intelligence-profile.json`;
-const PAPER_SIGNALS_PATH        = `${DATA_DIR}/paper-signals.json`;
-const RESOLVED_SIGNALS_PATH     = `${DATA_DIR}/resolved-signals.json`;
+const PAPER_SIGNALS_PATH        = `${DATA_DIR}/paper-signals.json`;   // M1
+const RESOLVED_SIGNALS_PATH     = `${DATA_DIR}/resolved-signals.json`; // M2
 
 // ---------------------------------------------------------------------------
 // In-memory state
@@ -53,69 +73,77 @@ let candleStore     = { pairs: {} };
 let calendarCache   = { data: [], fetchedAt: 0 };
 let intelligenceProfile = null;
 
-let dailyCallCount      = 0;
-let callCountResetAt    = nextMidnightUTC();
+let dailyCallCount    = 0;
+let callCountResetAt  = nextMidnightUTC();
 let lastCollectionError = null;
 
-let intelligenceStatus         = 'pending'; // pending | calculating | active | stale
-let intelligenceLastCalculated = null;
+let backfillStatus        = 'pending';  // pending | running | complete | error
+let backfillPairsComplete = 0;
+let backfillTotalCandles  = 0;
+
+let intelligenceStatus          = 'pending'; // pending | calculating | active | stale
+let intelligenceLastCalculated  = null;
 
 // ---------------------------------------------------------------------------
 // SMC / DXY in-memory state
 // ---------------------------------------------------------------------------
-let currentDXYBias   = 'NEUTRAL';
+let currentDXYBias   = 'NEUTRAL'; // updated by background DXY refresh
 let dxyLastFetchedAt = null;
 
-// Paper signals buffer (ring buffer, max 500 entries)
+// Paper signals buffer (up to 500 entries)
 const PAPER_SIGNALS_MAX = 500;
 let paperSignalsBuffer = [];
 
 // Resolved signals buffer for ensemble retraining
-// Each entry: { features: number[], outcome: 0|1 }
-let resolvedSignalsBuffer  = [];
-let newResolvedSinceRetrain = 0; // incremented on each new resolved outcome
+// Each entry: { features: number[], outcome: bool }
+let resolvedSignalsBuffer = [];
+let newResolvedSinceRetrain = 0;
 
 // Track last Holy Trinity signal time per pair (for 24h fallback)
+// { 'EUR/USD': Date, ... }
 const lastHolyTrinityAt = {};
 
-// Candle push batching — push to canister every N hours to minimise cycle usage
+// Candle push batching: only push candles to canister every N hours.
+// Configurable via env var — default 2 hours.
 let lastCandlePushTime = 0;
 const CANDLE_PUSH_INTERVAL_MS = parseInt(process.env.CANDLE_PUSH_INTERVAL_MS, 10) || (2 * 60 * 60 * 1000);
 
 // Concurrent collection cycle guard
 let isCollectionRunning = false;
-let collectionStartTime = 0;
+let collectionStartTime = 0; // M5: safety timeout tracking
 
 // ---------------------------------------------------------------------------
-// @dfinity/agent canister actor setup
+// @dfinity/agent canister actor setup (C1)
 // ---------------------------------------------------------------------------
 const backendIDL = ({ IDL }) => {
   const SignalDirection = IDL.Variant({ 'Buy': IDL.Null, 'Sell': IDL.Null });
+  // Lean input type — matches SignalRecordTypes.SignalInput on the backend
   const PushSignalInput = IDL.Record({
-    pair:                  IDL.Text,
-    direction:             SignalDirection,
-    confidence:            IDL.Nat,
-    signalTypeKey:         IDL.Nat,
-    entryPrice:            IDL.Float64,
-    stopLoss:              IDL.Float64,
-    takeProfit1:           IDL.Float64,
-    takeProfit2:           IDL.Float64,
-    timestamp:             IDL.Int,
-    sessionAtGeneration:   IDL.Text,
-    dxyBias:               IDL.Text,
-    dxyStale:              IDL.Bool,
-    fvgPresent:            IDL.Bool,
-    fvgZoneHigh:           IDL.Float64,
-    fvgZoneLow:            IDL.Float64,
-    orderBlockPresent:     IDL.Bool,
-    obZoneHigh:            IDL.Float64,
-    obZoneLow:             IDL.Float64,
-    liquiditySweepPresent: IDL.Bool,
-    killzoneActive:        IDL.Bool,
-    isPaper:               IDL.Bool,
-    plainReason:           IDL.Text,
-    modelVersion:          IDL.Text,
+    pair:                   IDL.Text,
+    direction:              SignalDirection,
+    confidence:             IDL.Nat,
+    signalTypeKey:          IDL.Nat,
+    entryPrice:             IDL.Float64,
+    stopLoss:               IDL.Float64,
+    takeProfit1:            IDL.Float64,
+    takeProfit2:            IDL.Float64,
+    timestamp:              IDL.Int,
+    sessionAtGeneration:    IDL.Text,
+    dxyBias:                IDL.Text,
+    dxyStale:               IDL.Bool,
+    fvgPresent:             IDL.Bool,
+    fvgZoneHigh:            IDL.Float64,
+    fvgZoneLow:             IDL.Float64,
+    orderBlockPresent:      IDL.Bool,
+    obZoneHigh:             IDL.Float64,
+    obZoneLow:              IDL.Float64,
+    liquiditySweepPresent:  IDL.Bool,
+    killzoneActive:         IDL.Bool,
+    isPaper:                IDL.Bool,
+    plainReason:            IDL.Text,
+    modelVersion:           IDL.Text,
   });
+  // CandleInput matches CandlePushTypes.CandleInput on the backend
   const CandleInput = IDL.Record({
     datetime: IDL.Text,
     open:     IDL.Float64,
@@ -126,8 +154,11 @@ const backendIDL = ({ IDL }) => {
   });
   const Result = IDL.Variant({ 'ok': IDL.Nat, 'err': IDL.Text });
   return IDL.Service({
+    // pushSignalInput: lean input, returns Result<Nat, Text>
     pushSignalInput: IDL.Func([PushSignalInput], [Result], []),
+    // pushCandles: positional (pair, candles), returns Bool
     pushCandles:     IDL.Func([IDL.Text, IDL.Vec(CandleInput)], [IDL.Bool], []),
+    // getCandlePage: paginated candle read for proxy restore-from-canister
     getCandlePage:   IDL.Func([IDL.Text, IDL.Nat, IDL.Nat], [IDL.Vec(CandleInput)], ['query']),
   });
 };
@@ -143,9 +174,10 @@ async function initCanisterActor() {
     if (hexKey) {
       try {
         const derBuffer = Buffer.from(hexKey, 'hex');
-        const seed      = derBuffer.slice(16, 48);
-        identity        = Ed25519KeyIdentity.fromSecretKey(seed);
-        console.log('[canister] Proxy identity loaded. Principal:', identity.getPrincipal().toText());
+        const seed = derBuffer.slice(16, 48);
+        identity = Ed25519KeyIdentity.fromSecretKey(seed);
+        const principal = identity.getPrincipal().toText();
+        console.log('[canister] Proxy identity loaded. Principal:', principal);
       } catch (identityErr) {
         console.error('[canister] Failed to load proxy identity from PROXY_IDENTITY_KEY:', identityErr.message);
         identity = null;
@@ -153,13 +185,13 @@ async function initCanisterActor() {
     } else {
       console.error('CRITICAL: PROXY_IDENTITY_KEY not set — canister calls will be anonymous and rejected');
     }
-    const agent = new HttpAgent(identity ? { host, identity } : { host });
+    const agentOpts = identity ? { host, identity } : { host };
+    const agent = new HttpAgent(agentOpts);
     canisterActor = Actor.createActor(backendIDL, {
       agent,
-      // FIX: correct fallback canister ID
-      canisterId: process.env.CANISTER_ID || 'n4eej-giaaa-aaaae-aanwa-cai',
+      canisterId: process.env.CANISTER_ID || 'i5pap-wiaaa-aaaad-agq6q-cai',
     });
-    console.log('[canister] Actor initialized for canister:', process.env.CANISTER_ID || 'n4eej-giaaa-aaaae-aanwa-cai');
+    console.log('[canister] Actor initialized for canister:', process.env.CANISTER_ID);
   } catch (e) {
     console.error('[canister] Failed to initialize actor:', e.message);
   }
@@ -169,9 +201,17 @@ async function initCanisterActor() {
 // Utility helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Returns the UTC timestamp for the start of the next calendar day in UTC.
+ * Uses explicit UTC month arithmetic to handle month boundaries correctly.
+ */
 function nextMidnightUTC() {
-  const now = new Date();
-  return Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1);
+  const now   = new Date();
+  const year  = now.getUTCFullYear();
+  const month = now.getUTCMonth();
+  const date  = now.getUTCDate();
+  // Start of the next calendar day — safe across all month/year boundaries
+  return Date.UTC(year, month, date + 1);
 }
 
 function incrementCallCount() {
@@ -183,11 +223,11 @@ function incrementCallCount() {
 }
 
 /**
- * Timing-safe secret comparison — SEC-H3.
- * Returns false immediately if PROXY_SECRET is not configured.
+ * Timing-safe secret comparison to prevent timing attacks.
+ * SEC-H3: returns false immediately if PROXY_SECRET is not configured.
  */
 function secretMatches(provided) {
-  if (_proxySecretMissing) return false;
+  if (_proxySecretMissing) return false; // SEC-H3: no secret configured — block all
   if (!PROXY_SECRET || !provided) return false;
   try {
     const a = Buffer.from(PROXY_SECRET, 'utf8');
@@ -200,8 +240,10 @@ function secretMatches(provided) {
 }
 
 /**
- * CORS — SEC-H2: uses ALLOWED_ORIGIN env var only.
- * If unset, no header is emitted and browsers block all cross-origin requests.
+ * CORS — uses ALLOWED_ORIGIN env var only.
+ * SEC-H2: if ALLOWED_ORIGIN is not set, no Access-Control-Allow-Origin header is set,
+ * which means browsers will block all cross-origin requests (same as blocking all origins).
+ * A startup warning is logged so the operator is aware.
  */
 if (!process.env.ALLOWED_ORIGIN) {
   console.warn('WARNING: ALLOWED_ORIGIN is not set — all browser cross-origin requests will be blocked by CORS.');
@@ -209,9 +251,9 @@ if (!process.env.ALLOWED_ORIGIN) {
 function cors(res) {
   const origin = process.env.ALLOWED_ORIGIN;
   if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
+  // If no origin is set, no CORS header is emitted — browsers block cross-origin calls (SEC-H2)
 }
-
-// CORS preflight — must come before all routes
+// C4 — CORS OPTIONS preflight handler (must come before all routes)
 app.options('*', (req, res) => {
   const origin = process.env.ALLOWED_ORIGIN;
   if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
@@ -220,7 +262,7 @@ app.options('*', (req, res) => {
   res.sendStatus(204);
 });
 
-// Persist paper signals to disk (atomic write)
+// M1 — Persist paper signals to /data
 function savePaperSignals() {
   try {
     const tmp = PAPER_SIGNALS_PATH + '.tmp';
@@ -229,7 +271,7 @@ function savePaperSignals() {
   } catch (e) { console.error('[persist] paper signals save failed:', e.message); }
 }
 
-// Persist resolved signals to disk (atomic write)
+// M2 — Persist resolved signals to /data
 function saveResolvedSignals() {
   try {
     const tmp = RESOLVED_SIGNALS_PATH + '.tmp';
@@ -238,7 +280,9 @@ function saveResolvedSignals() {
   } catch (e) { console.error('[persist] resolved signals save failed:', e.message); }
 }
 
-/** Atomic JSON write: write to .tmp then rename to prevent corruption on crash. */
+/**
+ * Atomic file write: write to .tmp then rename to prevent corruption on crash.
+ */
 function atomicWriteJSON(filePath, data) {
   const tmpPath = filePath + '.tmp';
   fs.writeFileSync(tmpPath, JSON.stringify(data), 'utf8');
@@ -250,7 +294,9 @@ function atomicWriteJSON(filePath, data) {
 // ---------------------------------------------------------------------------
 try {
   if (fs.existsSync(CANDLE_STORE_PATH)) {
-    candleStore = JSON.parse(fs.readFileSync(CANDLE_STORE_PATH, 'utf8'));
+    const raw = fs.readFileSync(CANDLE_STORE_PATH, 'utf8');
+    candleStore = JSON.parse(raw);
+    // Populate historyCache from store so /history works immediately
     historyCache.data = { pairs: {} };
     for (const pair of Object.keys(candleStore.pairs)) {
       historyCache.data.pairs[pair] = candleStore.pairs[pair].slice(-5000);
@@ -264,8 +310,10 @@ try {
 
 try {
   if (fs.existsSync(INTELLIGENCE_PROFILE_PATH)) {
-    intelligenceProfile        = JSON.parse(fs.readFileSync(INTELLIGENCE_PROFILE_PATH, 'utf8'));
-    intelligenceStatus         = 'active';
+    const raw = fs.readFileSync(INTELLIGENCE_PROFILE_PATH, 'utf8');
+    intelligenceProfile = JSON.parse(raw);
+    intelligenceStatus  = 'active';
+    // NEW-M2: _calculatedAt may be missing in older profile versions — guard with optional chaining
     intelligenceLastCalculated = intelligenceProfile._calculatedAt ?? null;
     console.log('[startup] Intelligence profile loaded from disk.');
   }
@@ -274,6 +322,7 @@ try {
   intelligenceProfile = null;
 }
 
+// M1 — Restore paper signals buffer from disk
 try {
   if (fs.existsSync(PAPER_SIGNALS_PATH)) {
     paperSignalsBuffer = JSON.parse(fs.readFileSync(PAPER_SIGNALS_PATH, 'utf8'));
@@ -284,6 +333,7 @@ try {
   paperSignalsBuffer = [];
 }
 
+// M2 — Restore resolved signals buffer from disk
 try {
   if (fs.existsSync(RESOLVED_SIGNALS_PATH)) {
     resolvedSignalsBuffer = JSON.parse(fs.readFileSync(RESOLVED_SIGNALS_PATH, 'utf8'));
@@ -292,6 +342,11 @@ try {
 } catch (err) {
   console.error('[startup] Failed to restore resolved signals:', err.message);
   resolvedSignalsBuffer = [];
+}
+
+// Warn clearly if MASSIVE_API_KEY is absent
+if (!process.env.MASSIVE_API_KEY) {
+  console.warn('[startup] WARNING: MASSIVE_API_KEY not set — backfill will fail with 403');
 }
 
 // ---------------------------------------------------------------------------
@@ -306,13 +361,12 @@ function resolveOldSignals() {
     if (age >= 24 * 60 * 60 * 1000) {
       sig.resolvedAt = new Date().toISOString();
       resolved++;
+      // H2: feed resolved paper signal outcome into resolvedSignalsBuffer for model training
       const pairIntel = intelligenceProfile && intelligenceProfile[sig.pair];
       resolvedSignalsBuffer.push({
         features: ensembleScorer.extractFeatures(sig, pairIntel, undefined),
         outcome:  sig.outcome === 'WIN' ? 1 : 0
       });
-      // FIX: increment counter so retraining logic can use it
-      newResolvedSinceRetrain++;
     }
   }
   if (resolved > 0) {
@@ -326,46 +380,69 @@ function resolveOldSignals() {
 // Technical indicator helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Calculate ATR (Average True Range) for an array of OHLC candles.
+ * @param {Array} candles  — [{open, high, low, close}...] sorted ascending
+ * @param {number} period
+ * @returns {number[]} ATR values (length = candles.length - 1, aligned to index 1..n)
+ */
 function calculateATR(candles, period = 14) {
   if (candles.length < 2) return [];
   const trs = [];
   for (let i = 1; i < candles.length; i++) {
     const curr = candles[i];
     const prev = candles[i - 1];
-    trs.push(Math.max(
+    const tr = Math.max(
       curr.high - curr.low,
       Math.abs(curr.high - prev.close),
       Math.abs(curr.low  - prev.close)
-    ));
+    );
+    trs.push(tr);
   }
   const atrs = [];
   let sum = 0;
   for (let i = 0; i < trs.length; i++) {
     if (i < period) {
       sum += trs[i];
-      atrs.push(i === period - 1 ? sum / period : NaN);
+      if (i === period - 1) atrs.push(sum / period);
+      else atrs.push(NaN);
     } else {
-      atrs.push((atrs[atrs.length - 1] * (period - 1) + trs[i]) / period);
+      const prev = atrs[atrs.length - 1];
+      atrs.push((prev * (period - 1) + trs[i]) / period);
     }
   }
   return atrs;
 }
 
+/**
+ * Calculate RSI for an array of candles.
+ * @param {Array} candles — [{close}...] sorted ascending
+ * @param {number} period
+ * @returns {number[]} RSI values (NaN for initial period)
+ */
 function calculateRSI(candles, period = 14) {
   if (candles.length < period + 1) return candles.map(() => NaN);
   const rsi = new Array(candles.length).fill(NaN);
-  let avgGain = 0, avgLoss = 0;
+  let avgGain = 0;
+  let avgLoss = 0;
+
   for (let i = 1; i <= period; i++) {
     const diff = candles[i].close - candles[i - 1].close;
     if (diff >= 0) avgGain += diff / period;
     else           avgLoss += Math.abs(diff) / period;
   }
-  rsi[period] = 100 - 100 / (1 + (avgLoss === 0 ? Infinity : avgGain / avgLoss));
+
+  const firstRS = avgLoss === 0 ? Infinity : avgGain / avgLoss;
+  rsi[period] = 100 - 100 / (1 + firstRS);
+
   for (let i = period + 1; i < candles.length; i++) {
     const diff = candles[i].close - candles[i - 1].close;
-    avgGain = (avgGain * (period - 1) + (diff > 0 ? diff : 0)) / period;
-    avgLoss = (avgLoss * (period - 1) + (diff < 0 ? Math.abs(diff) : 0)) / period;
-    rsi[i]  = 100 - 100 / (1 + (avgLoss === 0 ? Infinity : avgGain / avgLoss));
+    const gain = diff > 0 ? diff : 0;
+    const loss = diff < 0 ? Math.abs(diff) : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+    const rs = avgLoss === 0 ? Infinity : avgGain / avgLoss;
+    rsi[i] = 100 - 100 / (1 + rs);
   }
   return rsi;
 }
@@ -375,9 +452,11 @@ function calculateRSI(candles, period = 14) {
 // ---------------------------------------------------------------------------
 async function runCollection() {
   console.log(`[${new Date().toISOString()}] Collection cycle starting...`);
+
+  // Clear any stale error at the start of each new cycle
   lastCollectionError = null;
 
-  // Record oldest recent candle per pair to protect historical data
+  // M3: Record the oldest recent candle timestamp per pair to protect historical data
   const historicalCutoff = {};
   for (const pair of FOREX_PAIRS) {
     const existing = candleStore.pairs[pair];
@@ -386,17 +465,20 @@ async function runCollection() {
     }
   }
 
-  // Fetch rates — 8s stagger
+  // Fetch rates — 8s stagger between pairs to stay under 8 calls/minute limit
   for (let i = 0; i < FOREX_PAIRS.length; i++) {
     const pair = FOREX_PAIRS[i];
     if (i > 0) await new Promise(r => setTimeout(r, 8000));
     try {
       const response = await axios.get('https://api.twelvedata.com/exchange_rate', {
-        params:  { symbol: pair, apikey: API_KEY },
+        params: { symbol: pair, apikey: API_KEY },
         timeout: 10000
       });
       if (response.data && response.data.rate) {
-        ratesCache.data.pairs[pair] = { price: String(response.data.rate), fetchedAt: new Date().toISOString() };
+        ratesCache.data.pairs[pair] = {
+          price:     String(response.data.rate),
+          fetchedAt: new Date().toISOString()
+        };
         ratesCache.fetchedAt = Date.now();
       }
       incrementCallCount();
@@ -408,13 +490,13 @@ async function runCollection() {
 
   await new Promise(r => setTimeout(r, 8000));
 
-  // Fetch history — 8s stagger
+  // Fetch history — 8s stagger between pairs to stay under 8 calls/minute limit
   for (let i = 0; i < FOREX_PAIRS.length; i++) {
     const pair = FOREX_PAIRS[i];
     if (i > 0) await new Promise(r => setTimeout(r, 8000));
     try {
       const response = await axios.get('https://api.twelvedata.com/time_series', {
-        params:  { symbol: pair, interval: '1h', outputsize: 5000, apikey: API_KEY },
+        params: { symbol: pair, interval: '1h', outputsize: 5000, apikey: API_KEY },
         timeout: 30000
       });
       const newCandles = (response.data.values || [])
@@ -431,6 +513,7 @@ async function runCollection() {
       const map = {};
       for (const c of candleStore.pairs[pair]) map[c.datetime] = c;
       for (const c of newCandles) {
+        // M3: skip candles that would overwrite historical data older than the cutoff
         if (historicalCutoff[pair] && c.datetime < historicalCutoff[pair]) continue;
         map[c.datetime] = c;
       }
@@ -445,6 +528,7 @@ async function runCollection() {
     }
   }
 
+  // Atomic persist candles to disk (every cycle)
   try {
     atomicWriteJSON(CANDLE_STORE_PATH, candleStore);
     console.log(`[${new Date().toISOString()}] Collection complete. Daily calls: ${dailyCallCount}`);
@@ -453,23 +537,24 @@ async function runCollection() {
     console.error('[collection] Failed to write candle store to disk:', err.message);
   }
 
-  // Candle push to canister — batched every N hours
+  // Candle push to canister — batched every N hours to minimise cycle usage.
+  // Paper signals are NEVER included here; they live only in paperSignalsBuffer.
   const now = Date.now();
   if (now - lastCandlePushTime >= CANDLE_PUSH_INTERVAL_MS) {
     lastCandlePushTime = now;
     console.log('[collection] Candle push window reached. Starting canister sync.');
-    pushCandlesToCanister(JSON.parse(JSON.stringify(candleStore)))
-      .catch(err => console.error('[canister] Candle push failed:', err.message));
+    // C3: pass a deep copy snapshot to prevent race condition on mutable candleStore
+    pushCandlesToCanister(JSON.parse(JSON.stringify(candleStore))).catch(err => console.error('[canister] Candle push failed:', err.message));
   }
 }
 
 // ---------------------------------------------------------------------------
 // Economic calendar — Finnhub primary, ForexFactory RSS fallback
 // ---------------------------------------------------------------------------
-const CALENDAR_CACHE_TTL  = 60 * 60 * 1000; // 1 hour
-const CALENDAR_STALE_MS   = 12 * 60 * 60 * 1000; // 12 hours
-const RELEVANT_CURRENCIES = ['USD', 'EUR', 'GBP', 'JPY', 'CHF', 'AUD', 'CAD', 'NZD'];
+const CALENDAR_CACHE_TTL   = 60 * 60 * 1000; // 1 hour
+const RELEVANT_CURRENCIES  = ['USD', 'EUR', 'GBP', 'JPY', 'CHF', 'AUD', 'CAD', 'NZD'];
 
+// Map Finnhub country codes to currency codes
 const COUNTRY_TO_CURRENCY = {
   US: 'USD', EU: 'EUR', GB: 'GBP', JP: 'JPY',
   CH: 'CHF', AU: 'AUD', CA: 'CAD', NZ: 'NZD',
@@ -484,18 +569,26 @@ async function fetchCalendar() {
   if (FINNHUB_API_KEY) {
     try {
       const response = await axios.get('https://finnhub.io/api/v1/calendar/economic', {
-        params:  { from, to, token: FINNHUB_API_KEY },
+        params: { from, to, token: FINNHUB_API_KEY },
         timeout: 10000
       });
       const events = (response.data.economicCalendar || [])
         .filter(e => {
-          const impact   = (e.impact || '').toLowerCase();
+          const impact   = (e.impact   || '').toLowerCase();
+          // Map country code to currency ONCE here
           const currency = COUNTRY_TO_CURRENCY[(e.country || '').toUpperCase()] || (e.country || '').toUpperCase();
           return impact === 'high' && RELEVANT_CURRENCIES.includes(currency);
         })
         .map(e => {
           const currency = COUNTRY_TO_CURRENCY[(e.country || '').toUpperCase()] || (e.country || '').toUpperCase();
-          return { time: e.time, currency, event: e.event, impact: e.impact, forecast: e.estimate || null, previous: e.prev || null };
+          return {
+            time:     e.time,
+            currency, // correctly mapped currency code
+            event:    e.event,
+            impact:   e.impact,
+            forecast: e.estimate || null,
+            previous: e.prev    || null
+          };
         });
       calendarCache = { data: events, fetchedAt: Date.now() };
       console.log(`[calendar] Finnhub: ${events.length} high-impact events.`);
@@ -506,9 +599,13 @@ async function fetchCalendar() {
   }
 
   // ForexFactory RSS fallback
+  // NEW-M6: check cache age before returning stale data
+  const CALENDAR_STALE_MS = 12 * 60 * 60 * 1000; // 12 hours
   const cacheAge = calendarCache.fetchedAt ? Date.now() - calendarCache.fetchedAt : Infinity;
   try {
-    const rssResponse = await axios.get('https://nfs.faireconomy.media/ff_calendar_thisweek.xml', { timeout: 10000 });
+    const rssResponse = await axios.get('https://nfs.faireconomy.media/ff_calendar_thisweek.xml', {
+      timeout: 10000
+    });
     const xml    = rssResponse.data;
     const events = [];
     const itemRe = /<item>([\s\S]*?)<\/item>/g;
@@ -527,33 +624,206 @@ async function fetchCalendar() {
     console.log(`[calendar] ForexFactory RSS: ${events.length} high-impact events.`);
   } catch (err) {
     console.error('[calendar] ForexFactory RSS fallback failed:', err.message);
+    // NEW-M6: return stale cache only if it is < 12 hours old
     if (cacheAge < CALENDAR_STALE_MS) {
       console.warn(`[calendar] Returning stale cache (${Math.round(cacheAge / 60000)} min old).`);
     } else {
-      console.warn('[calendar] Cache is older than 12 hours — returning empty event list.');
+      console.warn('[calendar] Cache is older than 12 hours — returning empty event list to avoid stale news filter.');
       calendarCache = { data: [], fetchedAt: calendarCache.fetchedAt };
     }
   }
 }
 
 // ---------------------------------------------------------------------------
+// Dukascopy 10-year historical backfill
+// ---------------------------------------------------------------------------
+async function runDukascopyBackfill() {
+  backfillStatus = 'running';
+  console.log('[backfill] Starting Dukascopy 10-year backfill...');
+
+  let getHistoricalRates;
+  try {
+    ({ getHistoricalRates } = require('dukascopy-node'));
+  } catch (err) {
+    backfillStatus = 'error';
+    console.error('[backfill] dukascopy-node not available:', err.message);
+    return;
+  }
+
+  // Load progress checkpoint
+  let progress = {};
+  try {
+    if (fs.existsSync(BACKFILL_PROGRESS_PATH)) {
+      progress = JSON.parse(fs.readFileSync(BACKFILL_PROGRESS_PATH, 'utf8'));
+    }
+  } catch (err) {
+    console.error('[backfill] Failed to load progress checkpoint:', err.message);
+    progress = {};
+  }
+
+  const now       = new Date();
+  const startYear = now.getUTCFullYear() - 10;
+
+  for (const pair of FOREX_PAIRS) {
+    if (progress[pair] === 'complete') {
+      console.log(`[backfill] ${pair}: already complete, skipping.`);
+      backfillPairsComplete++;
+      continue;
+    }
+
+    const existingCount = (candleStore[pair] || []).length;
+    if (existingCount > 10000) {
+      console.log('[backfill]', pair, 'already has', existingCount, 'candles — skipping');
+      continue;
+    }
+
+    const instrument = DUKASCOPY_INSTRUMENTS[pair];
+    if (!instrument) {
+      console.warn(`[backfill] ${pair}: no Dukascopy instrument mapping, skipping.`);
+      continue;
+    }
+
+    const adjustment = BID_TO_MID_ADJUSTMENT[pair] || 0;
+    let pairCandles  = [];
+    let yearsFailed  = 0;
+
+    for (let year = startYear; year <= now.getUTCFullYear(); year++) {
+      const yearStart = new Date(Date.UTC(year, 0, 1)).toISOString();
+      const yearEnd   = year === now.getUTCFullYear()
+        ? now.toISOString()
+        : new Date(Date.UTC(year + 1, 0, 1)).toISOString();
+
+      // Yield to event loop between each yearly fetch
+      await new Promise(r => setImmediate(r));
+
+      try {
+        console.log(`[backfill] ${pair} / ${year}: fetching...`);
+        const result = await getHistoricalRates({
+          instrument: instrument,
+          dates:      { from: new Date(yearStart), to: new Date(yearEnd) },
+          timeframe:  'h1',
+          format:     'object',
+          flushDownloadProgress: false
+        });
+
+        const raw = Array.isArray(result) ? result : [];
+        let prev  = null;
+        let kept  = 0;
+
+        for (const row of raw) {
+          // dukascopy-node 'object' format: { timestamp, open, high, low, close, volume }
+          const open  = (row.open  || row.askOpen  || 0) + adjustment;
+          const high  = (row.high  || row.askHigh  || 0) + adjustment;
+          const low   = (row.low   || row.askLow   || 0) + adjustment;
+          const close = (row.close || row.askClose || 0) + adjustment;
+
+          if (!open || !close) continue;
+
+          // Data quality filter: reject candles >20% away from previous close
+          if (prev !== null) {
+            const change = Math.abs(close - prev) / prev;
+            if (change > 0.20) {
+              console.warn(`[backfill] ${pair} outlier rejected: close=${close}, prev=${prev}`);
+              continue;
+            }
+          }
+
+          const ts = row.timestamp
+            ? new Date(row.timestamp).toISOString().slice(0, 19).replace('T', ' ')
+            : null;
+          if (!ts) continue;
+
+          pairCandles.push({ datetime: ts, open, high, low, close });
+          prev = close;
+          kept++;
+        }
+
+        console.log(`[backfill] ${pair} / ${year}: ${kept} candles kept.`);
+      } catch (err) {
+        yearsFailed++;
+        console.error(`[backfill] ${pair} / ${year}: fetch error: ${err.message}`);
+        if (yearsFailed >= 3) {
+          console.error(`[backfill] ${pair}: too many year failures, skipping pair.`);
+          break;
+        }
+      }
+
+      // Small pause between yearly batches to avoid hammering Dukascopy
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    if (pairCandles.length === 0) {
+      progress[pair] = 'incomplete';
+      try { atomicWriteJSON(BACKFILL_PROGRESS_PATH, progress); } catch (_) {}
+      continue;
+    }
+
+    // Merge with existing candleStore (no cap — deep history store)
+    if (!candleStore.pairs[pair]) candleStore.pairs[pair] = [];
+    const mapByDt = {};
+    for (const c of candleStore.pairs[pair]) mapByDt[c.datetime] = c;
+    for (const c of pairCandles)             mapByDt[c.datetime] = c;
+    const merged = Object.values(mapByDt).sort((a, b) => a.datetime < b.datetime ? -1 : 1);
+    candleStore.pairs[pair] = merged;
+    backfillTotalCandles   += pairCandles.length;
+
+    // Update historyCache working window
+    historyCache.data.pairs[pair] = merged.slice(-5000);
+
+    // Atomic persist candle store and checkpoint after each pair
+    try {
+      atomicWriteJSON(CANDLE_STORE_PATH, candleStore);
+    } catch (err) {
+      console.error('[backfill] Failed to persist candle store:', err.message);
+    }
+
+    progress[pair] = 'complete';
+    backfillPairsComplete++;
+    try { atomicWriteJSON(BACKFILL_PROGRESS_PATH, progress); } catch (_) {}
+
+    console.log(`[backfill] ${pair}: complete (${pairCandles.length} candles). Total so far: ${backfillTotalCandles}.`);
+  }
+
+  const allComplete = FOREX_PAIRS.every(p => progress[p] === 'complete');
+  backfillStatus = allComplete ? 'complete' : 'error';
+  console.log(`[backfill] Done. Status: ${backfillStatus}. Total candles: ${backfillTotalCandles}.`);
+}
+
+// ---------------------------------------------------------------------------
 // Intelligence profile calculation
 // ---------------------------------------------------------------------------
 
-function yieldLoop() { return new Promise(r => setImmediate(r)); }
-
-function percentile(sorted, p) {
-  if (!sorted.length) return 0;
-  return sorted[Math.floor((p / 100) * (sorted.length - 1))];
+/** Yield to event loop */
+function yieldLoop() {
+  return new Promise(r => setImmediate(r));
 }
 
+/** Percentile from sorted numeric array */
+function percentile(sorted, p) {
+  if (!sorted.length) return 0;
+  const idx = Math.floor((p / 100) * (sorted.length - 1));
+  return sorted[idx];
+}
+
+/**
+ * Session for a given UTC datetime string (YYYY-MM-DD HH:MM:SS)
+ * NEW-C2: aligned with backend signal_engine.mo session logic:
+ *   Tokyo:    0–8 UTC
+ *   London:   8–12 UTC
+ *   Overlap:  12–17 UTC (London+NY)
+ *   New York: 13–21 UTC
+ *   Sydney:   21–23 UTC and 0–5 UTC
+ */
 function classifySession(datetime) {
-  const hour       = parseInt(datetime.slice(11, 13), 10);
+  const hour = parseInt(datetime.slice(11, 13), 10);
+  // Sydney spans midnight: hours 21-23 and 0-4
   const sydneyOpen = hour >= 21 || hour < 5;
   const tokyoOpen  = hour >= 0  && hour < 8;
   const londonOpen = hour >= 8  && hour < 12;
   const overlap    = hour >= 12 && hour < 17;
   const nyOpen     = hour >= 13 && hour < 21;
+
+  // Priority order: overlap > NY > london > tokyo > sydney
   if (overlap)    return 'londonNY';
   if (nyOpen)     return 'newYork';
   if (londonOpen) return 'london';
@@ -563,14 +833,17 @@ function classifySession(datetime) {
 }
 
 async function calculateIntelligenceProfile() {
+  const totalPairs = FOREX_PAIRS.length;
+  let calculated   = 0;
+
   intelligenceStatus = 'calculating';
   console.log('[intelligence] Starting profile calculation...');
-  const profile  = { _calculatedAt: new Date().toISOString() };
-  const nowYear  = new Date().getUTCFullYear();
-  let calculated = 0;
+
+  const profile = { _calculatedAt: new Date().toISOString() };
 
   for (const pair of FOREX_PAIRS) {
     await yieldLoop();
+
     const candles = candleStore.pairs[pair];
     if (!candles || candles.length < 200) {
       console.warn(`[intelligence] ${pair}: insufficient candles (${(candles || []).length}), skipping.`);
@@ -579,7 +852,7 @@ async function calculateIntelligenceProfile() {
       continue;
     }
 
-    // ATR percentiles
+    // --- ATR percentiles ---
     await yieldLoop();
     const atrs    = calculateATR(candles, 14).filter(v => !isNaN(v));
     const atrSort = [...atrs].sort((a, b) => a - b);
@@ -590,20 +863,25 @@ async function calculateIntelligenceProfile() {
       p95: percentile(atrSort, 95)
     };
 
-    // Volatility regime
-    const recentATR    = calculateATR(candles.slice(-15), 14).filter(v => !isNaN(v));
-    const currentATR   = recentATR.length ? recentATR[recentATR.length - 1] : atrPercentiles.p50;
-    const volatilityRegime =
-      currentATR < atrPercentiles.p25 ? 'low'     :
-      currentATR < atrPercentiles.p75 ? 'normal'  :
-      currentATR < atrPercentiles.p95 ? 'high'    : 'extreme';
+    // Current volatility regime (last 14 candles)
+    const recentCandles = candles.slice(-15);
+    const recentATR     = calculateATR(recentCandles, 14).filter(v => !isNaN(v));
+    const currentATR    = recentATR.length ? recentATR[recentATR.length - 1] : atrPercentiles.p50;
+    let volatilityRegime;
+    if      (currentATR < atrPercentiles.p25) volatilityRegime = 'low';
+    else if (currentATR < atrPercentiles.p75) volatilityRegime = 'normal';
+    else if (currentATR < atrPercentiles.p95) volatilityRegime = 'high';
+    else                                       volatilityRegime = 'extreme';
 
-    // Adaptive RSI thresholds (walk-forward, train 70% / test 30%)
+    // --- Adaptive RSI thresholds (rolling walk-forward, train 70% / test 30%) ---
     await yieldLoop();
     const splitIdx    = Math.floor(candles.length * 0.7);
     const testCandles = candles.slice(splitIdx);
     const rsiValues   = calculateRSI(testCandles, 14);
-    let bestOversold = 30, bestOverbought = 70, bestScore = -Infinity;
+
+    let bestOversold   = 30;
+    let bestOverbought = 70;
+    let bestScore      = -Infinity;
 
     for (let os = 25; os <= 45; os += 2.5) {
       for (let ob = 55; ob <= 75; ob += 2.5) {
@@ -611,9 +889,10 @@ async function calculateIntelligenceProfile() {
         for (let i = 1; i < testCandles.length - 4; i++) {
           const rsi = rsiValues[i];
           if (isNaN(rsi)) continue;
-          const isBuy = rsi < os, isSell = rsi > ob;
+          const isBuy  = rsi < os;
+          const isSell = rsi > ob;
           if (!isBuy && !isSell) continue;
-          const atr1    = atrs.length ? atrs[Math.min(splitIdx + i, atrs.length - 1)] : 0.001;
+          const atr1 = atrs.length ? atrs[Math.min(splitIdx + i, atrs.length - 1)] : 0.001;
           const future4 = testCandles.slice(i + 1, i + 5).map(c => c.close);
           if (future4.length < 4) continue;
           const maxMove = isBuy
@@ -624,28 +903,45 @@ async function calculateIntelligenceProfile() {
         }
         if (total < 20) continue;
         const score = wins / total;
-        if (score > bestScore) { bestScore = score; bestOversold = os; bestOverbought = ob; }
+        if (score > bestScore) {
+          bestScore      = score;
+          bestOversold   = os;
+          bestOverbought = ob;
+        }
       }
     }
+    const adaptiveRSI = { oversold: bestOversold, overbought: bestOverbought };
 
-    // Session win rate matrix
+    // --- Session win rate matrix ---
     await yieldLoop();
-    const sessions      = ['london', 'newYork', 'londonNY', 'tokyo', 'sydney'];
+    const sessions = ['london', 'newYork', 'londonNY', 'tokyo', 'sydney'];
     const sessionMatrix = {};
     for (const sess of sessions) sessionMatrix[sess] = { wins: 0, total: 0 };
 
+    // Exponential decay weight per year (most recent = 1.0, each prior = *0.85)
+    const nowYear = new Date().getUTCFullYear();
+
     for (let i = 14; i < candles.length - 4; i++) {
-      const c    = candles[i];
+      const c   = candles[i];
       const sess = classifySession(c.datetime);
       if (!sess) continue;
-      const weight  = Math.pow(0.85, nowYear - parseInt(c.datetime.slice(0, 4), 10));
-      const atrVal  = atrs[Math.max(0, i - 1)] || atrPercentiles.p50;
+
+      const candleYear   = parseInt(c.datetime.slice(0, 4), 10);
+      const yearsAgo     = nowYear - candleYear;
+      const weight       = Math.pow(0.85, yearsAgo);
+
+      // Win: price moves >= 1×ATR in next 4 candles
+      const atrIdx  = Math.max(0, i - 1);  // offset: ATR array starts at index 1
+      const atrVal  = atrs[atrIdx] || atrPercentiles.p50;
       const future4 = candles.slice(i + 1, i + 5);
       if (future4.length < 4) continue;
-      const upMove   = Math.max(...future4.map(fc => fc.close)) - c.close;
-      const downMove = c.close - Math.min(...future4.map(fc => fc.close));
+
+      const upMove   = future4.length ? Math.max(...future4.map(fc => fc.close)) - c.close : 0;
+      const downMove = future4.length ? c.close - Math.min(...future4.map(fc => fc.close)) : 0;
+      const moved    = Math.max(upMove, downMove) >= atrVal;
+
       sessionMatrix[sess].total += weight;
-      if (Math.max(upMove, downMove) >= atrVal) sessionMatrix[sess].wins += weight;
+      if (moved) sessionMatrix[sess].wins += weight;
     }
 
     const finalSessionMatrix = {};
@@ -653,35 +949,39 @@ async function calculateIntelligenceProfile() {
       const { wins, total } = sessionMatrix[sess];
       const winRate    = total >= 5 ? wins / total : 0.55;
       const sampleSize = Math.round(total);
-      finalSessionMatrix[sess] = {
-        winRate:    Math.round(winRate * 1000) / 1000,
-        sampleSize,
-        confidence: sampleSize >= 500 ? 'high' : sampleSize >= 200 ? 'medium' : sampleSize >= 100 ? 'low' : 'insufficient'
-      };
+      const confidence = sampleSize >= 500 ? 'high' :
+                         sampleSize >= 200 ? 'medium' :
+                         sampleSize >= 100 ? 'low' : 'insufficient';
+      finalSessionMatrix[sess] = { winRate: Math.round(winRate * 1000) / 1000, sampleSize, confidence };
     }
 
-    // Seasonal bias
+    // --- Seasonal bias ---
     await yieldLoop();
     const monthBuckets = {};
     for (let m = 1; m <= 12; m++) monthBuckets[m] = { totalWeight: 0, moveWeight: 0 };
 
     for (let i = 14; i < candles.length - 4; i++) {
-      const c      = candles[i];
-      const month  = parseInt(c.datetime.slice(5, 7), 10);
-      const weight = Math.pow(0.85, nowYear - parseInt(c.datetime.slice(0, 4), 10));
+      const c = candles[i];
+      const month      = parseInt(c.datetime.slice(5, 7), 10);
+      const candleYear = parseInt(c.datetime.slice(0, 4), 10);
+      const yearsAgo   = nowYear - candleYear;
+      const weight     = Math.pow(0.85, yearsAgo);
+
       const atrVal  = atrs[Math.max(0, i - 1)] || atrPercentiles.p50;
       const future4 = candles.slice(i + 1, i + 5);
       if (future4.length < 4) continue;
-      const upMove   = Math.max(...future4.map(fc => fc.close)) - c.close;
-      const downMove = c.close - Math.min(...future4.map(fc => fc.close));
+      const upMove   = future4.length ? Math.max(...future4.map(fc => fc.close)) - c.close : 0;
+      const downMove = future4.length ? c.close - Math.min(...future4.map(fc => fc.close)) : 0;
+      const relMove  = Math.max(upMove, downMove) / atrVal;
+
       monthBuckets[month].totalWeight += weight;
-      monthBuckets[month].moveWeight  += weight * (Math.max(upMove, downMove) / atrVal);
+      monthBuckets[month].moveWeight  += weight * relMove;
     }
 
+    const seasonalBias = {};
     const avgMove = Object.values(monthBuckets)
       .filter(b => b.totalWeight > 0)
       .reduce((s, b) => s + b.moveWeight / b.totalWeight, 0) / 12 || 1;
-    const seasonalBias = {};
     for (let m = 1; m <= 12; m++) {
       const b = monthBuckets[m];
       seasonalBias[String(m)] = b.totalWeight > 0
@@ -690,18 +990,18 @@ async function calculateIntelligenceProfile() {
     }
 
     profile[pair] = {
-      adaptiveRSI:    { oversold: bestOversold, overbought: bestOverbought },
+      adaptiveRSI,
       atrPercentiles,
-      sessionMatrix:  finalSessionMatrix,
+      sessionMatrix: finalSessionMatrix,
       seasonalBias,
       volatilityRegime,
       profileVersion: 1,
       lastCalculated: new Date().toISOString(),
-      status:         'active'
+      status: 'active'
     };
 
     calculated++;
-    console.log(`[intelligence] ${pair}: done (${calculated}/${FOREX_PAIRS.length}).`);
+    console.log(`[intelligence] ${pair}: done (${calculated}/${totalPairs}).`);
   }
 
   intelligenceProfile        = profile;
@@ -721,17 +1021,15 @@ async function calculateIntelligenceProfile() {
 // ---------------------------------------------------------------------------
 async function runSMCEvaluation() {
   try {
-    const dxyData    = await smcEngine.fetchDXYData();
+    // Refresh DXY (fire-and-forget with cached result — never blocks)
+    const dxyData = await smcEngine.fetchDXYData();
     currentDXYBias   = smcEngine.calculateDXYTrend(dxyData);
     dxyLastFetchedAt = new Date().toISOString();
   } catch (err) {
-    const staleSecs = dxyLastFetchedAt
-      ? Math.round((Date.now() - new Date(dxyLastFetchedAt).getTime()) / 1000)
-      : null;
-    console.warn('[SMC] DXY refresh failed:', err.message + '.' +
-      (staleSecs !== null
-        ? ` Current DXY bias (${currentDXYBias}) is ${staleSecs}s old.`
-        : ' No DXY data available yet.'));
+    // BUG-M13: log DXY staleness when fetch fails
+    const staleSecs = dxyLastFetchedAt ? Math.round((Date.now() - new Date(dxyLastFetchedAt).getTime()) / 1000) : null;
+    const staleMsg  = staleSecs !== null ? ` Current DXY bias (${currentDXYBias}) is ${staleSecs}s old.` : ' No DXY data available yet.';
+    console.warn('[SMC] DXY refresh failed:', err.message + '.' + staleMsg);
   }
 
   const killzone = smcEngine.isInsideKillzone();
@@ -741,10 +1039,12 @@ async function runSMCEvaluation() {
       const candles = candleStore.pairs[pair];
       if (!candles || candles.length < 50) continue;
 
-      const rsiVals = calculateRSI(candles, 14);
-      const lastRSI = rsiVals[rsiVals.length - 1];
+      // ---- Derive a candidate direction from simple RSI bias ----
+      const rsiVals   = calculateRSI(candles, 14);
+      const lastRSI   = rsiVals[rsiVals.length - 1];
       if (isNaN(lastRSI)) continue;
 
+      // BUG-M12: null-check intelligenceProfile before ANY use (was checked too late)
       const pairProfile  = intelligenceProfile ? intelligenceProfile[pair] : null;
       const oversold     = (pairProfile && pairProfile.adaptiveRSI) ? pairProfile.adaptiveRSI.oversold  : 35;
       const overbought   = (pairProfile && pairProfile.adaptiveRSI) ? pairProfile.adaptiveRSI.overbought : 65;
@@ -754,119 +1054,206 @@ async function runSMCEvaluation() {
       if (lastRSI > overbought) candidateDirection = 'SELL';
       if (!candidateDirection) continue;
 
-      // FIX: indicatorPassed uses real RSI only — pairIntel never contains rsi/macd/adx fields
-      const isBuyDir       = candidateDirection === 'BUY';
-      const rsiOk          = isBuyDir ? lastRSI < 70 : lastRSI > 30;
-      const indicatorPassed = rsiOk;
+      // H3 — real indicator check: RSI + MACD + ADX from intelligence profile
+      const pairIntel = pairProfile || {};
+      const rsiForCheck = pairIntel.rsi || lastRSI || 50;
+      const macdHist = pairIntel.macdHistogram || 0;
+      const adx = pairIntel.adx || 0;
+      const isBuyDir = candidateDirection === 'BUY';
+      const rsiOk   = isBuyDir ? rsiForCheck < 70 : rsiForCheck > 30;
+      const macdOk  = isBuyDir ? macdHist > 0 : macdHist < 0;
+      const adxOk   = adx > 20;
+      const indicatorPassed = rsiOk && macdOk && adxOk;
 
-      // SMC detection
-      const obList      = smcEngine.detectOrderBlocks(candles, candidateDirection);
-      const fvgList     = smcEngine.detectFairValueGaps(candles, candidateDirection);
+      // ---- SMC detection ----
+      const obList     = smcEngine.detectOrderBlocks(candles, candidateDirection);
+      const fvgList    = smcEngine.detectFairValueGaps(candles, candidateDirection);
       const sweepResult = smcEngine.detectLiquiditySweep(candles);
       const pdZone      = smcEngine.getPremiumDiscountZone(candles);
-      const trinity     = smcEngine.evaluateHolyTrinity(candles, candidateDirection, obList, fvgList, sweepResult, pdZone);
+      const trinity     = smcEngine.evaluateHolyTrinity(
+        candles, candidateDirection, obList, fvgList, sweepResult, pdZone
+      );
 
-      // DXY penalty
+      // ---- DXY penalty ----
       const dxyPenalty = smcEngine.getDXYPenalty(currentDXYBias, pair, candidateDirection);
 
-      // Base confidence
-      const rawConfidence = isBuyDir
-        ? Math.min(100, Math.round(60 + (oversold  - lastRSI) * 2))
+      // ---- Base confidence (RSI distance from threshold, 60–100) ----
+      const rawConfidence = candidateDirection === 'BUY'
+        ? Math.min(100, Math.round(60 + (oversold - lastRSI) * 2))
         : Math.min(100, Math.round(60 + (lastRSI - overbought) * 2));
       const adjustedConfidence = Math.max(0, rawConfidence - dxyPenalty);
-      if (adjustedConfidence < 10) continue;
 
+      // NEW-M5: suppress signals with confidence below minimum threshold after DXY penalty
+      const MIN_CONFIDENCE_THRESHOLD = 10;
+      if (adjustedConfidence < MIN_CONFIDENCE_THRESHOLD) continue;
+
+      // ---- Signal type key ----
       const signalTypeKey = smcEngine.computeSignalTypeKey({
-        orderBlockPresent:     trinity.orderBlockPresent,
-        fvgPresent:            trinity.fvgPresent,
+        orderBlockPresent:    trinity.orderBlockPresent,
+        fvgPresent:           trinity.fvgPresent,
         liquiditySweepPresent: trinity.liquiditySweepPresent
       });
 
+      // ---- Classify ----
       const classification = smcEngine.classifySignal(trinity, indicatorPassed, killzone);
-      const isPaperSignal  = (classification !== 'LIVE' && classification !== 'STANDARD');
-      const now            = new Date();
+
+      const now        = new Date();
+      // isPaper is set immutably at creation time based on classification
+      const isPaperSignal = (classification !== 'LIVE' && classification !== 'STANDARD');
 
       const signalBase = {
         pair,
-        direction:             candidateDirection,
-        confidence:            adjustedConfidence,
-        orderBlockPresent:     trinity.orderBlockPresent,
-        fvgPresent:            trinity.fvgPresent,
-        liquiditySweepPresent: trinity.liquiditySweepPresent,
-        killzoneActive:        killzone.active,
-        killzoneName:          killzone.killzoneName || null,
-        dxyBias:               currentDXYBias,
-        obZone:                trinity.obZone,
-        fvgZone:               trinity.fvgZone,
-        ensembleScore:         null,
+        direction:              candidateDirection,
+        confidence:             adjustedConfidence,
+        orderBlockPresent:      trinity.orderBlockPresent,
+        fvgPresent:             trinity.fvgPresent,
+        liquiditySweepPresent:  trinity.liquiditySweepPresent,
+        killzoneActive:         killzone.active,
+        killzoneName:           killzone.killzoneName || null,
+        dxyBias:                currentDXYBias,
+        obZone:                 trinity.obZone,
+        fvgZone:                trinity.fvgZone,
+        ensembleScore:          null, // populated by XGBoost layer
         signalTypeKey,
-        generatedAt:           now.toISOString(),
-        isPaper:               isPaperSignal
+        generatedAt:            now.toISOString(),
+        // isPaper is frozen at creation — cannot change even if isModelTrained flips mid-cycle
+        isPaper:                isPaperSignal
       };
 
-      // Ensemble scoring
-      let ensembleScore = null, highConviction = false;
+      // ---- Ensemble scoring (async — await inside the async function) ----
+      let ensembleScore  = null;
+      let highConviction = false;
       if (classification === 'LIVE' || classification === 'STANDARD') {
         try {
           const sweepAge = (sweepResult && sweepResult.sweepCandleIndex != null)
             ? candles.length - 1 - sweepResult.sweepCandleIndex
             : undefined;
-          const score = await ensembleScorer.scoreSignal(ensembleScorer.extractFeatures(signalBase, null, sweepAge));
-          if (score !== null) { ensembleScore = score; highConviction = score >= 75; }
+          const features = ensembleScorer.extractFeatures(signalBase, null, sweepAge);
+          const score    = await ensembleScorer.scoreSignal(features);
+          if (score !== null) {
+            ensembleScore  = score;
+            highConviction = score >= 75;
+          }
         } catch (err) {
           console.warn(`[Ensemble] Scoring failed for ${pair}:`, err.message);
         }
       }
 
-      const demoteToPaper = ensembleScore !== null && ensembleScore < 40;
-
       if (classification === 'LIVE') {
+        // Demote to paper if ensembleScore < 40 (only when model is trained)
+        const demoteToPaper = ensembleScore !== null && ensembleScore < 40;
+
         if (demoteToPaper) {
-          pushToPaperBuffer({ ...signalBase, ensembleScore, isPaper: true, paperReason: 'ENSEMBLE_LOW_SCORE' });
+          const paperSignal = {
+            ...signalBase,
+            ensembleScore,
+            isPaper:     true, // explicit: demoted paper
+            paperReason: 'ENSEMBLE_LOW_SCORE'
+          };
+          if (paperSignalsBuffer.length >= PAPER_SIGNALS_MAX) {
+            const dropped = paperSignalsBuffer.shift();
+            console.log('[paper] Buffer full (500), dropping oldest signal:', dropped && dropped.id);
+          }
+          paperSignalsBuffer.push(paperSignal);
           console.log(`[SMC] LIVE demoted to PAPER (ensembleScore=${ensembleScore}): ${pair} ${candidateDirection}`);
         } else {
+          // Track last Holy Trinity signal time for 24h fallback
           lastHolyTrinityAt[pair] = now;
-          console.log(`[SMC] LIVE signal: ${pair} ${candidateDirection} (confidence ${adjustedConfidence}, typeKey ${signalTypeKey}, ensemble ${ensembleScore ?? 'N/A'})`);
-          pushSignalToCanister({ ...signalBase, ensembleScore, highConviction, isPaper: false });
+          const liveSignal = {
+            ...signalBase,
+            ensembleScore,
+            highConviction,
+            isPaper: false // explicit: not paper
+          };
+          console.log(`[SMC] LIVE signal: ${pair} ${candidateDirection} (confidence ${adjustedConfidence}, typeKey ${signalTypeKey}, ensemble ${ensembleScore !== null ? ensembleScore : 'N/A'})`);
+          // NOTE: Only LIVE and STANDARD signals go to canister. Paper signals NEVER go to canister.
+          pushSignalToCanister(liveSignal);
         }
 
       } else if (classification === 'PAPER_OUTSIDE_KILLZONE' || classification === 'PAPER_INDICATOR_FAILED') {
-        pushToPaperBuffer({ ...signalBase, ensembleScore: null, isPaper: true, paperReason: classification });
-        console.log(`[SMC] PAPER signal: ${pair} ${candidateDirection} (${classification})`);
+        const paperSignal = { ...signalBase, ensembleScore: null, isPaper: true, paperReason: classification };
+        // Buffer paper signals (ring buffer, drop oldest)
+        if (paperSignalsBuffer.length >= PAPER_SIGNALS_MAX) {
+          const dropped = paperSignalsBuffer.shift();
+          console.log('[paper] Buffer full (500), dropping oldest signal:', dropped && dropped.id);
+        }
+        paperSignalsBuffer.push(paperSignal);
+        console.log(`[SMC] PAPER signal: ${pair} ${candidateDirection} (${classification}) — stored in memory buffer only, NOT pushed to canister`);
 
       } else if (classification === 'STANDARD') {
+        // Standard indicator signal — confidence capped at 70
+        const demoteToPaper = ensembleScore !== null && ensembleScore < 40;
         if (demoteToPaper) {
-          pushToPaperBuffer({ ...signalBase, confidence: Math.min(70, adjustedConfidence), ensembleScore, isPaper: true, paperReason: 'ENSEMBLE_LOW_SCORE' });
+          const paperSignal = {
+            ...signalBase,
+            confidence:  Math.min(70, adjustedConfidence),
+            ensembleScore,
+            isPaper:     true,
+            paperReason: 'ENSEMBLE_LOW_SCORE'
+          };
+          if (paperSignalsBuffer.length >= PAPER_SIGNALS_MAX) {
+            const dropped = paperSignalsBuffer.shift();
+            console.log('[paper] Buffer full (500), dropping oldest signal:', dropped && dropped.id);
+          }
+          paperSignalsBuffer.push(paperSignal);
           console.log(`[SMC] STANDARD demoted to PAPER (ensembleScore=${ensembleScore}): ${pair} ${candidateDirection}`);
         } else {
-          const conf = Math.min(70, adjustedConfidence);
-          console.log(`[SMC] STANDARD signal: ${pair} ${candidateDirection} (confidence ${conf}, ensemble ${ensembleScore ?? 'N/A'})`);
-          pushSignalToCanister({ ...signalBase, confidence: conf, ensembleScore, highConviction, isPaper: false });
+          const standardSignal = {
+            ...signalBase,
+            confidence:    Math.min(70, adjustedConfidence),
+            ensembleScore,
+            highConviction,
+            isPaper:       false
+          };
+          console.log(`[SMC] STANDARD signal: ${pair} ${candidateDirection} (confidence ${standardSignal.confidence}, ensemble ${ensembleScore !== null ? ensembleScore : 'N/A'})`);
+          pushSignalToCanister(standardSignal);
         }
       }
 
-      // 24h fallback: surface best indicator signal if no Holy Trinity in 24h
+      // ---- 24h fallback: if no Holy Trinity signal for this pair in 24h, surface best indicator signal ----
       const holyTrinityAge = lastHolyTrinityAt[pair]
-        ? (now - lastHolyTrinityAt[pair]) / 3600000
+        ? (now - lastHolyTrinityAt[pair]) / 1000 / 3600
         : Infinity;
       if (holyTrinityAge > 24 && classification !== 'LIVE' && adjustedConfidence >= 50) {
-        let fbScore = null, fbHighConviction = false;
+        let fallbackEnsembleScore  = null;
+        let fallbackHighConviction = false;
         try {
-          const fbBase = { ...signalBase, confidence: Math.min(70, adjustedConfidence), isPaper: false,
-            signalTypeKey: 0, orderBlockPresent: false, fvgPresent: false, liquiditySweepPresent: false,
-            obZone: null, fvgZone: null, isFallback: true };
-          const fbSweepAge = sweepResult && sweepResult.sweepCandleIndex != null
-            ? candles.length - 1 - sweepResult.sweepCandleIndex : undefined;
-          fbScore         = await ensembleScorer.scoreSignal(ensembleScorer.extractFeatures(fbBase, null, fbSweepAge));
-          fbHighConviction = fbScore !== null && fbScore >= 75;
+          const fallbackBase = {
+            ...signalBase,
+            confidence:            Math.min(70, adjustedConfidence),
+            isPaper:               false,
+            signalTypeKey:         0,
+            orderBlockPresent:     false,
+            fvgPresent:            false,
+            liquiditySweepPresent: false,
+            obZone:                null,
+            fvgZone:               null,
+            isFallback:            true
+          };
+          const fbSweepAge = (sweepResult && sweepResult.sweepCandleIndex != null)
+              ? candles.length - 1 - sweepResult.sweepCandleIndex
+              : undefined;
+            const fbFeatures = ensembleScorer.extractFeatures(fallbackBase, null, fbSweepAge);
+          fallbackEnsembleScore  = await ensembleScorer.scoreSignal(fbFeatures);
+          fallbackHighConviction = fallbackEnsembleScore !== null && fallbackEnsembleScore >= 75;
         } catch (_) {}
-        console.log(`[SMC] FALLBACK signal: ${pair} ${candidateDirection} (24h without Holy Trinity, ensemble ${fbScore ?? 'N/A'})`);
-        pushSignalToCanister({
-          ...signalBase, confidence: Math.min(70, adjustedConfidence),
-          ensembleScore: fbScore, highConviction: fbHighConviction, isPaper: false,
-          signalTypeKey: 0, orderBlockPresent: false, fvgPresent: false, liquiditySweepPresent: false,
-          obZone: null, fvgZone: null, isFallback: true
-        });
+
+        const fallbackSignal = {
+          ...signalBase,
+          confidence:            Math.min(70, adjustedConfidence),
+          ensembleScore:         fallbackEnsembleScore,
+          highConviction:        fallbackHighConviction,
+          isPaper:               false,
+          signalTypeKey:         0,
+          orderBlockPresent:     false,
+          fvgPresent:            false,
+          liquiditySweepPresent: false,
+          obZone:                null,
+          fvgZone:               null,
+          isFallback:            true
+        };
+        console.log(`[SMC] FALLBACK signal: ${pair} ${candidateDirection} (24h without Holy Trinity, ensemble ${fallbackEnsembleScore !== null ? fallbackEnsembleScore : 'N/A'})`);
+        pushSignalToCanister(fallbackSignal);
       }
 
     } catch (err) {
@@ -875,68 +1262,69 @@ async function runSMCEvaluation() {
   }
 }
 
-/** Push to paper buffer — ring buffer, drops oldest when full */
-function pushToPaperBuffer(signal) {
-  if (paperSignalsBuffer.length >= PAPER_SIGNALS_MAX) {
-    const dropped = paperSignalsBuffer.shift();
-    console.log('[paper] Buffer full, dropping oldest signal:', dropped && dropped.id);
-  }
-  paperSignalsBuffer.push(signal);
-  savePaperSignals();
-}
-
 // ---------------------------------------------------------------------------
-// Canister push helpers
+// Canister push helpers — signal and candle push to IC backend
 // ---------------------------------------------------------------------------
+const CANISTER_HOST = process.env.CANISTER_HOST || null;
+const CANISTER_ID   = process.env.CANISTER_ID   || null;
 
+/**
+ * Push a single live signal to the canister via IC HTTP gateway.
+ * Only called for non-paper signals (isPaper === false).
+ * Silently skips if CANISTER_HOST / CANISTER_ID are not configured.
+ */
 async function pushSignalToCanister(signal) {
   if (!canisterActor) { console.warn('[canister] Actor not initialized'); return; }
-  if (signal.isPaper) return;
+  if (signal.isPaper) return; // safety guard — paper signals never go on-chain
   try {
-    const obZone  = signal.obZone  || {};
-    const fvgZone = signal.fvgZone || {};
+    const direction = (signal.direction || '').toUpperCase() === 'SELL'
+      ? { 'Sell': null } : { 'Buy': null };
+    const smcZones = signal.smcZones || {};
+    const obZone  = signal.obZone  || smcZones.orderBlock  || {};
+    const fvgZone = signal.fvgZone || smcZones.fvg || {};
     const _candles = candleStore.pairs[signal.pair];
     if (!_candles || _candles.length < 15) {
       console.warn(`[canister] Skipping signal push for ${signal.pair}: insufficient candles for ATR`);
       return;
     }
     const _atrs = calculateATR(_candles, 14);
-    const _atr  = _atrs.slice().reverse().find(v => v != null && !isNaN(v)) || 0;
+    const _atr = _atrs.slice().reverse().find(v => v != null && !isNaN(v)) || 0;
     if (_atr === 0) {
       console.warn(`[canister] Skipping signal push for ${signal.pair}: ATR is zero`);
       return;
     }
-    const _entry    = _candles[_candles.length - 1].close;
+    const _entry = _candles[_candles.length - 1].close;
     const _decimals = (_entry.toString().split('.')[1] || '').length || 5;
-    const _round    = v => parseFloat(v.toFixed(_decimals));
-    const _sl  = signal.direction === 'BUY' ? _round(_entry - 1.5 * _atr) : _round(_entry + 1.5 * _atr);
-    const _tp1 = signal.direction === 'BUY' ? _round(_entry + 2.0 * _atr) : _round(_entry - 2.0 * _atr);
+    const _round = (v) => parseFloat(v.toFixed(_decimals));
+    const _slDist = 1.5 * _atr;
+    const _tp1Dist = 2.0 * _atr;
+    const _sl = signal.direction === 'BUY' ? _round(_entry - _slDist) : _round(_entry + _slDist);
+    const _tp1 = signal.direction === 'BUY' ? _round(_entry + _tp1Dist) : _round(_entry - _tp1Dist);
 
     const input = {
-      pair:                  signal.pair || '',
-      direction:             signal.direction.toUpperCase() === 'SELL' ? { 'Sell': null } : { 'Buy': null },
-      confidence:            Math.min(100, Math.max(0, Math.round(signal.confidence || 0))),
-      signalTypeKey:         signal.signalTypeKey || 0,
-      entryPrice:            _entry,
-      stopLoss:              _sl,
-      takeProfit1:           _tp1,
-      takeProfit2:           _tp1,
-      // FIX: use generatedAt (ISO string) instead of undefined signal.timestamp
-      timestamp:             BigInt(Math.floor(new Date(signal.generatedAt).getTime() * 1_000_000)),
-      sessionAtGeneration:   signal.killzoneName || signal.session || signal.sessionAtGeneration || '',
-      dxyBias:               signal.dxyBias || 'UNKNOWN',
-      dxyStale:              signal.dxyStale === true,
-      fvgPresent:            signal.fvgPresent === true,
-      fvgZoneHigh:           Number(fvgZone.high || 0),
-      fvgZoneLow:            Number(fvgZone.low  || 0),
-      orderBlockPresent:     signal.orderBlockPresent === true,
-      obZoneHigh:            Number(obZone.high  || 0),
-      obZoneLow:             Number(obZone.low   || 0),
-      liquiditySweepPresent: signal.liquiditySweepPresent === true,
-      killzoneActive:        signal.killzoneActive === true,
-      isPaper:               false,
-      plainReason:           signal.reason || signal.plainReason || '',
-      modelVersion:          signal.modelVersion != null ? String(signal.modelVersion) : '',
+      pair:                   signal.pair         || '',
+      direction,
+      confidence:             Math.min(100, Math.max(0, Math.round(signal.confidence || 0))),
+      signalTypeKey:          signal.signalTypeKey || 0,
+      entryPrice:             _entry,
+      stopLoss:               _sl,
+      takeProfit1:            _tp1,
+      takeProfit2:            _tp1,
+      timestamp:              BigInt(Math.floor((signal.timestamp || Date.now()) * 1_000_000)),
+      sessionAtGeneration:    signal.killzoneName || signal.session || signal.sessionAtGeneration || '',
+      dxyBias:                signal.dxyBias     || 'UNKNOWN',
+      dxyStale:               signal.dxyStale    === true,
+      fvgPresent:             signal.fvgPresent   === true,
+      fvgZoneHigh:            Number(fvgZone.high || 0),
+      fvgZoneLow:             Number(fvgZone.low  || 0),
+      orderBlockPresent:      signal.orderBlockPresent === true,
+      obZoneHigh:             Number(obZone.high  || 0),
+      obZoneLow:              Number(obZone.low   || 0),
+      liquiditySweepPresent:  signal.liquiditySweepPresent === true,
+      killzoneActive:         signal.killzoneActive === true,
+      isPaper:                false,
+      plainReason:            signal.reason || signal.plainReason || '',
+      modelVersion:           signal.modelVersion != null ? String(signal.modelVersion) : '',
     };
     const result = await canisterActor.pushSignalInput(input);
     if ('ok' in result) {
@@ -949,6 +1337,10 @@ async function pushSignalToCanister(signal) {
   }
 }
 
+/**
+ * Push candle data to the canister, batched per pair (max 500 candles/pair).
+ * Silently skips if CANISTER_HOST / CANISTER_ID are not configured.
+ */
 async function pushCandlesToCanister(candleSnapshot) {
   if (!canisterActor) { console.warn('[canister] Actor not initialized'); return; }
   let totalPushed = 0;
@@ -956,15 +1348,25 @@ async function pushCandlesToCanister(candleSnapshot) {
     const candles = candleSnapshot.pairs[pair] || [];
     if (candles.length === 0) continue;
     try {
-      // Send last 500 candles per pair
-      const candleRecords = candles.slice(-500).map(c => ({
-        datetime: c.datetime || new Date(c.timestamp || 0).toISOString(),
-        open:     Number(c.open  || 0),
-        high:     Number(c.high  || 0),
-        low:      Number(c.low   || 0),
-        close:    Number(c.close || 0),
-        volume:   (c.volume != null && c.volume !== 0) ? [Number(c.volume)] : [],
-      }));
+      // FIX 2: CandleInput uses datetime (ISO text), no pair field, volume as opt ([v] or [])
+      const candleRecords = candles.slice(-200).map(c => {
+        const dt = c.datetime
+          ? c.datetime
+          : new Date(c.timestamp || 0).toISOString();
+        const vol = (c.volume != null && c.volume !== 0)
+          ? [Number(c.volume)]
+          : [];
+        return {
+          datetime: dt,
+          open:     Number(c.open  || 0),
+          high:     Number(c.high  || 0),
+          low:      Number(c.low   || 0),
+          close:    Number(c.close || 0),
+          volume:   vol,
+        };
+      });
+      // FIX 1: positional args (pair, candles), not a record object
+      // FIX 4: returns Bool, not Result variant
       const ok = await canisterActor.pushCandles(pair, candleRecords);
       if (ok === true) {
         totalPushed += candleRecords.length;
@@ -975,21 +1377,30 @@ async function pushCandlesToCanister(candleSnapshot) {
       console.error('[canister] Candles push failed:', pair, e.message);
     }
   }
-  if (totalPushed > 0) console.log('[canister] Candles pushed — total records:', totalPushed);
+  if (totalPushed > 0) {
+    console.log('[canister] Candles pushed — total records:', totalPushed);
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Rate limiter & auth middleware
+// Rate limiters — L8
 // ---------------------------------------------------------------------------
 const publicLimiter = rateLimit({
-  windowMs: 60 * 1000, max: 60,
-  standardHeaders: true, legacyHeaders: false,
+  windowMs: 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
   message: { error: 'Too many requests, please try again later.' }
 });
 
+// ---------------------------------------------------------------------------
+// Auth middleware — timing-safe secret check
+// ---------------------------------------------------------------------------
 function requireSecret(req, res, next) {
   const provided = req.headers['x-forexmind-key'] || '';
-  if (!secretMatches(provided)) return res.status(401).json({ error: 'Unauthorized' });
+  if (!secretMatches(provided)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
   next();
 }
 
@@ -997,37 +1408,74 @@ function requireSecret(req, res, next) {
 // Routes
 // ---------------------------------------------------------------------------
 
-// FIX: /smc-status now authenticated
-app.get('/smc-status', requireSecret, (req, res) => {
+// ---------------------------------------------------------------------------
+// Ensemble status endpoint
+// ---------------------------------------------------------------------------
+// H5 — secured with requireSecret
+app.get('/ensemble-status', requireSecret, (req, res) => {
+  cors(res);
+  res.json(ensembleScorer.getEnsembleStatus());
+});
+
+// ---------------------------------------------------------------------------
+// Paper signals endpoint
+// ---------------------------------------------------------------------------
+// H4 — secured with requireSecret
+app.get('/paper-signals', requireSecret, (req, res) => {
+  cors(res);
+  const limit = req.query.limit ? parseInt(req.query.limit, 10) : paperSignalsBuffer.length;
+  const safe  = isNaN(limit) ? paperSignalsBuffer.length : Math.min(limit, paperSignalsBuffer.length);
+  res.json({
+    count:   paperSignalsBuffer.length,
+    signals: paperSignalsBuffer.slice(-safe)
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SMC status endpoint
+// ---------------------------------------------------------------------------
+app.get('/smc-status', (req, res) => {
   cors(res);
   try {
-    const killzone    = smcEngine.isInsideKillzone();
-    const dxyCache    = smcEngine.getDXYCache();
+    const killzone  = smcEngine.isInsideKillzone();
+    const dxyCache  = smcEngine.getDXYCache();
     const activePairs = {};
+
     for (const pair of FOREX_PAIRS) {
       const candles = candleStore.pairs[pair];
       if (!candles || candles.length < 50) {
         activePairs[pair] = { activeOBCount: 0, activeFVGCount: 0, lastSweepAge: null, premiumDiscount: 'UNKNOWN' };
         continue;
       }
-      const obsBuy   = smcEngine.detectOrderBlocks(candles, 'BUY');
-      const obsSell  = smcEngine.detectOrderBlocks(candles, 'SELL');
+
+      // Use BUY + SELL OBs for count
+      const obsBuy  = smcEngine.detectOrderBlocks(candles, 'BUY');
+      const obsSell = smcEngine.detectOrderBlocks(candles, 'SELL');
       const fvgsBuy  = smcEngine.detectFairValueGaps(candles, 'BUY');
       const fvgsSell = smcEngine.detectFairValueGaps(candles, 'SELL');
       const sweep    = smcEngine.detectLiquiditySweep(candles);
       const pdZone   = smcEngine.getPremiumDiscountZone(candles);
+
+      let lastSweepAge = null;
+      if (sweep.sweepCandleIndex !== null) {
+        lastSweepAge = candles.length - 1 - sweep.sweepCandleIndex;
+      }
+
+      const pdLabel = pdZone.isPremium ? 'PREMIUM' : pdZone.isDiscount ? 'DISCOUNT' : 'NEUTRAL';
+
       activePairs[pair] = {
-        activeOBCount:   obsBuy.length + obsSell.length,
-        activeFVGCount:  fvgsBuy.length + fvgsSell.length,
-        lastSweepAge:    sweep.sweepCandleIndex !== null ? candles.length - 1 - sweep.sweepCandleIndex : null,
-        premiumDiscount: pdZone.isPremium ? 'PREMIUM' : pdZone.isDiscount ? 'DISCOUNT' : 'NEUTRAL'
+        activeOBCount:  obsBuy.length + obsSell.length,
+        activeFVGCount: fvgsBuy.length + fvgsSell.length,
+        lastSweepAge,
+        premiumDiscount: pdLabel
       };
     }
+
     res.json({
-      dxyBias:        currentDXYBias,
-      dxyLastFetched: dxyLastFetchedAt || (dxyCache.fetchedAt ? new Date(dxyCache.fetchedAt).toISOString() : null),
-      killzoneActive: killzone.active,
-      killzoneName:   killzone.killzoneName,
+      dxyBias:         currentDXYBias,
+      dxyLastFetched:  dxyLastFetchedAt || (dxyCache.fetchedAt ? new Date(dxyCache.fetchedAt).toISOString() : null),
+      killzoneActive:  killzone.active,
+      killzoneName:    killzone.killzoneName,
       activePairs
     });
   } catch (err) {
@@ -1036,17 +1484,24 @@ app.get('/smc-status', requireSecret, (req, res) => {
   }
 });
 
-app.get('/rates', publicLimiter, (req, res) => { cors(res); res.json(ratesCache.data); });
+app.get('/rates', publicLimiter, (req, res) => {
+  cors(res);
+  res.json(ratesCache.data);
+});
 
-app.get('/history', publicLimiter, (req, res) => { cors(res); res.json(historyCache.data); });
+app.get('/history', publicLimiter, (req, res) => {
+  cors(res);
+  res.json(historyCache.data);
+});
 
+// /stored-history — authenticated + M4 hard limit
 app.get('/stored-history', requireSecret, publicLimiter, (req, res) => {
   cors(res);
   const rawLimit = parseInt(req.query.limit, 10);
   if (req.query.limit !== undefined && (isNaN(rawLimit) || rawLimit <= 0)) {
     return res.status(400).json({ error: 'Limit must be a positive integer' });
   }
-  const limit   = rawLimit > 0 ? Math.min(rawLimit, 5000) : 5000;
+  const limit = (rawLimit > 0) ? Math.min(rawLimit, 5000) : 5000;
   const limited = { pairs: {} };
   for (const pair of Object.keys(candleStore.pairs)) {
     limited.pairs[pair] = candleStore.pairs[pair].slice(-limit);
@@ -1056,68 +1511,77 @@ app.get('/stored-history', requireSecret, publicLimiter, (req, res) => {
 
 app.get('/calendar', publicLimiter, (req, res) => {
   cors(res);
-  res.json({ events: calendarCache.data, fetchedAt: calendarCache.fetchedAt ? new Date(calendarCache.fetchedAt).toISOString() : null, count: calendarCache.data.length });
+  res.json({
+    events:    calendarCache.data,
+    fetchedAt: calendarCache.fetchedAt ? new Date(calendarCache.fetchedAt).toISOString() : null,
+    count:     calendarCache.data.length
+  });
 });
 
-// FIX: /intelligence now authenticated
-app.get('/intelligence', requireSecret, (req, res) => {
+app.get('/intelligence', (req, res) => {
   cors(res);
   if (!intelligenceProfile || intelligenceStatus === 'calculating' || intelligenceStatus === 'pending') {
-    return res.json({ status: 'calculating', pairsTotal: FOREX_PAIRS.length });
+    return res.json({
+      status:      'calculating',
+      pairsComplete: backfillPairsComplete,
+      pairsTotal:    FOREX_PAIRS.length
+    });
   }
-  res.json({ status: 'active', profile: intelligenceProfile, fetchedAt: intelligenceLastCalculated, profileVersion: 1 });
+  res.json({
+    status:         'active',
+    profile:        intelligenceProfile,
+    fetchedAt:      intelligenceLastCalculated,
+    profileVersion: 1
+  });
 });
 
 app.get('/status', publicLimiter, (req, res) => {
   cors(res);
   const storeCounts = {};
-  for (const pair of FOREX_PAIRS) storeCounts[pair] = (candleStore.pairs[pair] || []).length;
+  for (const pair of FOREX_PAIRS) {
+    storeCounts[pair] = (candleStore.pairs[pair] || []).length;
+  }
   res.json({
-    callsToday:            dailyCallCount,
-    limit:                 800,
-    resetAt:               new Date(callCountResetAt).toUTCString(),
-    candlePairsStored:     Object.keys(candleStore.pairs).length,
-    candleCountPerPair:    storeCounts,
-    calendarEvents:        calendarCache.data.length,
-    calendarFetchedAt:     calendarCache.fetchedAt ? new Date(calendarCache.fetchedAt).toISOString() : null,
+    callsToday:               dailyCallCount,
+    limit:                    800,
+    resetAt:                  new Date(callCountResetAt).toUTCString(),
+    candlePairsStored:        Object.keys(candleStore.pairs).length,
+    candleCountPerPair:       storeCounts,
+    calendarEvents:           calendarCache.data.length,
+    calendarFetchedAt:        calendarCache.fetchedAt ? new Date(calendarCache.fetchedAt).toISOString() : null,
+    backfillStatus,
+    backfillPairsComplete,
+    backfillPairsTotal:       FOREX_PAIRS.length,
+    backfillTotalCandles,
     intelligenceStatus,
     intelligenceLastCalculated,
-    lastCollectionError:   lastCollectionError || null
+    lastCollectionError:      lastCollectionError || null
   });
 });
 
 app.get('/health', publicLimiter, (req, res) => {
   cors(res);
   res.json({
-    status:           'ok',
-    uptime:           process.uptime(),
-    ratesCachedAt:    ratesCache.fetchedAt    ? new Date(ratesCache.fetchedAt).toISOString()    : null,
-    historyCachedAt:  historyCache.fetchedAt  ? new Date(historyCache.fetchedAt).toISOString()  : null,
-    calendarCachedAt: calendarCache.fetchedAt ? new Date(calendarCache.fetchedAt).toISOString() : null,
+    status:            'ok',
+    uptime:            process.uptime(),
+    ratesCachedAt:     ratesCache.fetchedAt   ? new Date(ratesCache.fetchedAt).toISOString()   : null,
+    historyCachedAt:   historyCache.fetchedAt ? new Date(historyCache.fetchedAt).toISOString() : null,
+    calendarCachedAt:  calendarCache.fetchedAt ? new Date(calendarCache.fetchedAt).toISOString() : null,
     intelligenceStatus
   });
 });
 
-app.get('/ensemble-status', requireSecret, (req, res) => {
-  cors(res);
-  res.json(ensembleScorer.getEnsembleStatus());
-});
-
-app.get('/paper-signals', requireSecret, (req, res) => {
-  cors(res);
-  const limit = req.query.limit ? parseInt(req.query.limit, 10) : paperSignalsBuffer.length;
-  const safe  = isNaN(limit) ? paperSignalsBuffer.length : Math.min(limit, paperSignalsBuffer.length);
-  res.json({ count: paperSignalsBuffer.length, signals: paperSignalsBuffer.slice(-safe) });
-});
-
 // ---------------------------------------------------------------------------
-// Start server
+// Start server — all background jobs launched AFTER server is listening
 // ---------------------------------------------------------------------------
 app.listen(PORT, () => {
   console.log(`[${new Date().toISOString()}] ForexMind proxy running on port ${PORT}`);
 
+  // Twelve Data collection — start immediately, then every 15 minutes.
+  // isCollectionRunning guards against concurrent cycles.
   const runCollectionWithSMC = async () => {
     if (isCollectionRunning) {
+      // M5: safety timeout — force reset if stuck >= 10 minutes (was >, off-by-one fixed)
       const elapsed = collectionStartTime ? Date.now() - collectionStartTime : 0;
       if (elapsed >= 10 * 60 * 1000) {
         console.warn('[collection] Safety timeout: force-resetting after', Math.round(elapsed / 1000), 's');
@@ -1134,33 +1598,49 @@ app.listen(PORT, () => {
       await runSMCEvaluation().catch(err => console.error('[SMC] Post-collection evaluation error:', err.message));
     } finally {
       isCollectionRunning = false;
-      collectionStartTime = null;
+      collectionStartTime = null; // BUG-H7/NEW-M4: always reset so elapsed never grows monotonically
     }
   };
   runCollectionWithSMC();
   setInterval(runCollectionWithSMC, 15 * 60 * 1000);
 
+  // DXY initial fetch (background, non-blocking)
   smcEngine.fetchDXYData()
-    .then(data => { currentDXYBias = smcEngine.calculateDXYTrend(data); dxyLastFetchedAt = new Date().toISOString(); console.log(`[DXY] Initial trend: ${currentDXYBias}`); })
-    .catch(err  => console.warn('[DXY] Initial fetch failed:', err.message));
+    .then(data => {
+      currentDXYBias   = smcEngine.calculateDXYTrend(data);
+      dxyLastFetchedAt = new Date().toISOString();
+      console.log(`[DXY] Initial trend: ${currentDXYBias}`);
+    })
+    .catch(err => console.warn('[DXY] Initial fetch failed:', err.message));
 
+  // Economic calendar — start immediately, then every hour
   fetchCalendar();
   setInterval(fetchCalendar, CALENDAR_CACHE_TTL);
 
+  // Dukascopy backfill — non-blocking background job
+  setImmediate(() => runDukascopyBackfill());
+
+  // Intelligence profile — first calculation after 2 minutes (allow backfill to run),
+  // then recalculate every 6 hours (was 30 days — fresher volatility regime)
   setTimeout(() => calculateIntelligenceProfile(), 2 * 60 * 1000);
   setInterval(() => calculateIntelligenceProfile(), 6 * 60 * 60 * 1000);
 
+  // Resolve any paper signals that passed their 24h window during the previous session
   setTimeout(() => resolveOldSignals(), 5 * 1000);
 
+  // C1 — initialise canister actor on startup, then seed ensemble scorer from canister
   initCanisterActor().then(() => {
+    // NEW-H6: seed ensemble scorer from resolved signals already in the buffer
+    // If resolved signals were restored from disk, init immediately — no cold start
     if (resolvedSignalsBuffer.length >= 100) {
       console.log(`[Ensemble] Seeding from ${resolvedSignalsBuffer.length} restored resolved signals...`);
       ensembleScorer.initEnsembleScorer(resolvedSignalsBuffer);
     } else {
-      console.log(`[Ensemble] Insufficient resolved signals on startup (${resolvedSignalsBuffer.length}). Model will activate once 100+ outcomes are available.`);
+      console.log('[Ensemble] Insufficient resolved signals on startup (' + resolvedSignalsBuffer.length + '). Model will activate once 100+ outcomes are available.');
     }
   }).catch(err => console.error('[canister] Actor init error:', err.message));
 
+  // H1 — retrain ensemble model daily
   setInterval(() => {
     try { ensembleScorer.retrainIfNeeded(resolvedSignalsBuffer); }
     catch (e) { console.error('[ensemble] Retrain interval error:', e.message); }
