@@ -2,11 +2,10 @@ services:
   - type: web
     name: forex-proxy
     runtime: node
-    buildCommand: npm install
+    plan: starter
+    buildCommand: npm install --legacy-peer-deps
     startCommand: node server.js
     envVars:
-      - key: PORT
-        value: 3000
       - key: DATA_DIR
         value: /data
     disk:
