@@ -849,7 +849,7 @@ async function runDukascopyBackfill() {
         console.log(`[backfill] ${pair} / ${year}: ${kept} candles kept.`);
       } catch (err) {
         yearsFailed++;
-        console.error(`[backfill] ${pair} / ${year}: fetch error: ${err.message}`);
+        console.error(`[backfill] ${pair} / ${year}: fetch error:`, err);
         if (yearsFailed >= 3) {
           console.error(`[backfill] ${pair}: too many year failures, skipping pair.`);
           break;
