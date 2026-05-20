@@ -892,7 +892,7 @@ async function runDukascopyBackfill() {
             instrument: instrument,
             dates:      { from: new Date(yearStart), to: new Date(yearEnd) },
             timeframe:  'h1',
-            format:     'object',
+            format:     'json',
             flushDownloadProgress: false
           });
           yearSuccess = true;
