@@ -189,6 +189,99 @@ const backendIDL = ({ IDL }) => {
       })), err: IDL.Text })],
       []
     ),
+    // --- NEW: model state, intelligence profiles, DXY state, paper signals ---
+    pushModelState: IDL.Func(
+      [IDL.Record({
+        weights: IDL.Vec(IDL.Float64),
+        bias: IDL.Float64,
+        means: IDL.Vec(IDL.Float64),
+        stds: IDL.Vec(IDL.Float64),
+        oosAccuracy: IDL.Float64,
+        trainedAt: IDL.Int,
+      })],
+      [IDL.Variant({ ok: IDL.Null, err: IDL.Text })],
+      []
+    ),
+    getModelState: IDL.Func(
+      [],
+      [IDL.Variant({ ok: IDL.Opt(IDL.Record({
+        weights: IDL.Vec(IDL.Float64),
+        bias: IDL.Float64,
+        means: IDL.Vec(IDL.Float64),
+        stds: IDL.Vec(IDL.Float64),
+        oosAccuracy: IDL.Float64,
+        trainedAt: IDL.Int,
+      })), err: IDL.Text })],
+      ['query']
+    ),
+    pushIntelligenceProfiles: IDL.Func(
+      [IDL.Vec(IDL.Record({
+        pair: IDL.Text,
+        volatilityRegime: IDL.Text,
+        adxClass: IDL.Text,
+        sessionQuality: IDL.Float64,
+        updatedAt: IDL.Int,
+      }))],
+      [IDL.Variant({ ok: IDL.Null, err: IDL.Text })],
+      []
+    ),
+    getIntelligenceProfiles: IDL.Func(
+      [],
+      [IDL.Variant({ ok: IDL.Vec(IDL.Record({
+        pair: IDL.Text,
+        volatilityRegime: IDL.Text,
+        adxClass: IDL.Text,
+        sessionQuality: IDL.Float64,
+        updatedAt: IDL.Int,
+      })), err: IDL.Text })],
+      ['query']
+    ),
+    pushDxyState: IDL.Func(
+      [IDL.Record({
+        trend: IDL.Text,
+        dataPoints: IDL.Vec(IDL.Float64),
+        fetchedAt: IDL.Int,
+      })],
+      [IDL.Variant({ ok: IDL.Null, err: IDL.Text })],
+      []
+    ),
+    getDxyState: IDL.Func(
+      [],
+      [IDL.Variant({ ok: IDL.Opt(IDL.Record({
+        trend: IDL.Text,
+        dataPoints: IDL.Vec(IDL.Float64),
+        fetchedAt: IDL.Int,
+      })), err: IDL.Text })],
+      ['query']
+    ),
+    pushPaperSignals: IDL.Func(
+      [IDL.Vec(IDL.Record({
+        pair: IDL.Text,
+        direction: IDL.Text,
+        entryPrice: IDL.Float64,
+        sl: IDL.Float64,
+        tp: IDL.Float64,
+        confidence: IDL.Float64,
+        timestamp: IDL.Int,
+        smcPatterns: IDL.Vec(IDL.Text),
+      }))],
+      [IDL.Variant({ ok: IDL.Null, err: IDL.Text })],
+      []
+    ),
+    getPaperSignals: IDL.Func(
+      [],
+      [IDL.Variant({ ok: IDL.Vec(IDL.Record({
+        pair: IDL.Text,
+        direction: IDL.Text,
+        entryPrice: IDL.Float64,
+        sl: IDL.Float64,
+        tp: IDL.Float64,
+        confidence: IDL.Float64,
+        timestamp: IDL.Int,
+        smcPatterns: IDL.Vec(IDL.Text),
+      })), err: IDL.Text })],
+      ['query']
+    ),
   });
 };
 
@@ -779,7 +872,8 @@ async function runDukascopyBackfill() {
       continue;
     }
 
-    const existingCount = (candleStore[pair] || []).length;
+    // CHANGE 1: fixed — use candleStore.pairs[pair] not candleStore[pair]
+    const existingCount = ((candleStore.pairs && candleStore.pairs[pair]) || []).length;
     if (existingCount > 10000) {
       console.log('[backfill]', pair, 'already has', existingCount, 'candles — skipping');
       continue;
@@ -804,60 +898,74 @@ async function runDukascopyBackfill() {
       // Yield to event loop between each yearly fetch
       await new Promise(r => setImmediate(r));
 
-      try {
-        console.log(`[backfill] ${pair} / ${year}: fetching...`);
-        const result = await getHistoricalRates({
-          instrument: instrument,
-          dates:      { from: new Date(yearStart), to: new Date(yearEnd) },
-          timeframe:  'h1',
-          format: 'json',
-          flushDownloadProgress: false
-        });
+      // OPTION A: retry each year up to 3 times with 12s backoff on transient failure
+      let yearSucceeded = false;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          console.log(`[backfill] ${pair} / ${year}: fetching... (attempt ${attempt}/3)`);
+          const result = await getHistoricalRates({
+            instrument: instrument,
+            dates:      { from: new Date(yearStart), to: new Date(yearEnd) },
+            timeframe:  'h1',
+            format: 'json',
+            flushDownloadProgress: false
+          });
 
-        const raw = Array.isArray(result) ? result : [];
-        let prev  = null;
-        let kept  = 0;
+          const raw = Array.isArray(result) ? result : [];
+          let prev  = null;
+          let kept  = 0;
 
-        for (const row of raw) {
-          // dukascopy-node 'object' format: { timestamp, open, high, low, close, volume }
-          const open  = (row.open  || row.askOpen  || 0) + adjustment;
-          const high  = (row.high  || row.askHigh  || 0) + adjustment;
-          const low   = (row.low   || row.askLow   || 0) + adjustment;
-          const close = (row.close || row.askClose || 0) + adjustment;
+          for (const row of raw) {
+            // dukascopy-node 'object' format: { timestamp, open, high, low, close, volume }
+            const open  = (row.open  || row.askOpen  || 0) + adjustment;
+            const high  = (row.high  || row.askHigh  || 0) + adjustment;
+            const low   = (row.low   || row.askLow   || 0) + adjustment;
+            const close = (row.close || row.askClose || 0) + adjustment;
 
-          if (!open || !close) continue;
+            if (!open || !close) continue;
 
-          // Data quality filter: reject candles >20% away from previous close
-          if (prev !== null) {
-            const change = Math.abs(close - prev) / prev;
-            if (change > 0.20) {
-              console.warn(`[backfill] ${pair} outlier rejected: close=${close}, prev=${prev}`);
-              continue;
+            // Data quality filter: reject candles >20% away from previous close
+            if (prev !== null) {
+              const change = Math.abs(close - prev) / prev;
+              if (change > 0.20) {
+                console.warn(`[backfill] ${pair} outlier rejected: close=${close}, prev=${prev}`);
+                continue;
+              }
             }
+
+            const ts = row.timestamp
+              ? new Date(row.timestamp).toISOString().slice(0, 19).replace('T', ' ')
+              : null;
+            if (!ts) continue;
+
+            pairCandles.push({ datetime: ts, open, high, low, close });
+            prev = close;
+            kept++;
           }
 
-          const ts = row.timestamp
-            ? new Date(row.timestamp).toISOString().slice(0, 19).replace('T', ' ')
-            : null;
-          if (!ts) continue;
-
-          pairCandles.push({ datetime: ts, open, high, low, close });
-          prev = close;
-          kept++;
+          console.log(`[backfill] ${pair} / ${year}: ${kept} candles kept.`);
+          yearSucceeded = true;
+          break; // success — no more retries needed for this year
+        } catch (err) {
+          console.error(`[backfill] ${pair} / ${year}: fetch error (attempt ${attempt}/3):`, err.message || err);
+          if (attempt < 3) {
+            console.log(`[backfill] ${pair} / ${year}: retrying in 12s...`);
+            await new Promise(r => setTimeout(r, 12000));
+          }
         }
+      }
 
-        console.log(`[backfill] ${pair} / ${year}: ${kept} candles kept.`);
-      } catch (err) {
+      if (!yearSucceeded) {
         yearsFailed++;
-        console.error(`[backfill] ${pair} / ${year}: fetch error:`, err);
+        console.error(`[backfill] ${pair} / ${year}: all 3 attempts failed.`);
         if (yearsFailed >= 3) {
-          console.error(`[backfill] ${pair}: too many year failures, skipping pair.`);
+          console.error(`[backfill] ${pair}: too many year failures (${yearsFailed}), skipping pair.`);
           break;
         }
       }
 
       // Small pause between yearly batches to avoid hammering Dukascopy
-      await new Promise(r => setTimeout(r, 500));
+      await new Promise(r => setTimeout(r, 2000));
     }
 
     if (pairCandles.length === 0) {
@@ -1119,6 +1227,17 @@ async function calculateIntelligenceProfile() {
   try {
     atomicWriteJSON(INTELLIGENCE_PROFILE_PATH, profile);
     console.log('[intelligence] Profile saved to disk.');
+
+    // CHANGE 8: push intelligence profiles to canister after saving
+    canisterActor && canisterActor.pushIntelligenceProfiles(
+      FOREX_PAIRS.map(pair => ({
+        pair,
+        volatilityRegime: profile[pair]?.volatilityRegime || 'normal',
+        adxClass: 'UNKNOWN',
+        sessionQuality: 0.5,
+        updatedAt: BigInt(Date.now()),
+      }))
+    ).catch(err => console.warn('[canister] Intelligence profile push failed:', err.message));
   } catch (err) {
     console.error('[intelligence] Failed to persist profile:', err.message);
   }
@@ -1133,6 +1252,13 @@ async function runSMCEvaluation() {
     const dxyData = await smcEngine.fetchDXYData();
     currentDXYBias   = smcEngine.calculateDXYTrend(dxyData);
     dxyLastFetchedAt = new Date().toISOString();
+
+    // CHANGE 6: push DXY state to canister after successful fetch
+    canisterActor && canisterActor.pushDxyState({
+      trend: currentDXYBias,
+      dataPoints: Array.isArray(dxyData) ? dxyData : [],
+      fetchedAt: BigInt(Date.now()),
+    }).catch(err => console.warn('[canister] DXY state push failed:', err.message));
   } catch (err) {
     // BUG-M13: log DXY staleness when fetch fails
     const staleSecs = dxyLastFetchedAt ? Math.round((Date.now() - new Date(dxyLastFetchedAt).getTime()) / 1000) : null;
@@ -1263,6 +1389,10 @@ async function runSMCEvaluation() {
             console.log('[paper] Buffer full (500), dropping oldest signal:', dropped && dropped.id);
           }
           paperSignalsBuffer.push(paperSignal);
+          // CHANGE 9: periodic paper signals push to canister
+          if (paperSignalsBuffer.length % 10 === 0) {
+            pushPaperSignalsToCanister(paperSignalsBuffer).catch(() => {});
+          }
           console.log(`[SMC] LIVE demoted to PAPER (ensembleScore=${ensembleScore}): ${pair} ${candidateDirection}`);
         } else {
           // Track last Holy Trinity signal time for 24h fallback
@@ -1286,6 +1416,10 @@ async function runSMCEvaluation() {
           console.log('[paper] Buffer full (500), dropping oldest signal:', dropped && dropped.id);
         }
         paperSignalsBuffer.push(paperSignal);
+        // CHANGE 9: periodic paper signals push to canister
+        if (paperSignalsBuffer.length % 10 === 0) {
+          pushPaperSignalsToCanister(paperSignalsBuffer).catch(() => {});
+        }
         console.log(`[SMC] PAPER signal: ${pair} ${candidateDirection} (${classification}) — stored in memory buffer only, NOT pushed to canister`);
 
       } else if (classification === 'STANDARD') {
@@ -1304,6 +1438,10 @@ async function runSMCEvaluation() {
             console.log('[paper] Buffer full (500), dropping oldest signal:', dropped && dropped.id);
           }
           paperSignalsBuffer.push(paperSignal);
+          // CHANGE 9: periodic paper signals push to canister
+          if (paperSignalsBuffer.length % 10 === 0) {
+            pushPaperSignalsToCanister(paperSignalsBuffer).catch(() => {});
+          }
           console.log(`[SMC] STANDARD demoted to PAPER (ensembleScore=${ensembleScore}): ${pair} ${candidateDirection}`);
         } else {
           const standardSignal = {
@@ -1548,6 +1686,98 @@ async function restoreResolvedOutcomesFromCanister() {
 }
 
 // ---------------------------------------------------------------------------
+// CHANGE 5: New canister restore/push helper functions
+// ---------------------------------------------------------------------------
+
+async function restoreModelStateFromCanister() {
+  if (!canisterActor) return;
+  try {
+    const result = await canisterActor.getModelState();
+    if (!result || result.err) return;
+    const modelState = result.ok && result.ok.length > 0 ? result.ok[0] : null;
+    if (!modelState) return;
+    ensembleScorer.importModelState(modelState);
+    console.log('[canister] Restored model state from canister');
+  } catch (err) {
+    console.warn('[canister] restoreModelStateFromCanister failed:', err.message || err);
+  }
+}
+
+async function restoreIntelligenceProfilesFromCanister() {
+  if (!canisterActor || intelligenceProfile) return;
+  try {
+    const result = await canisterActor.getIntelligenceProfiles();
+    if (!result || result.err) return;
+    const profiles = Array.isArray(result.ok) ? result.ok : [];
+    if (profiles.length === 0) return;
+    const restored = { _calculatedAt: new Date().toISOString() };
+    for (const cp of profiles) {
+      restored[cp.pair] = { volatilityRegime: cp.volatilityRegime || 'normal', status: 'active' };
+    }
+    intelligenceProfile = restored;
+    console.log('[canister] Restored intelligence profiles from canister');
+  } catch (err) {
+    console.warn('[canister] restoreIntelligenceProfilesFromCanister failed:', err.message);
+  }
+}
+
+async function restoreDxyStateFromCanister() {
+  if (!canisterActor) return;
+  try {
+    const result = await canisterActor.getDxyState();
+    if (!result || result.err) return;
+    const dxyState = result.ok && result.ok.length > 0 ? result.ok[0] : null;
+    if (!dxyState) return;
+    currentDXYBias = dxyState.trend || 'NEUTRAL';
+    dxyLastFetchedAt = new Date(Number(dxyState.fetchedAt)).toISOString();
+    console.log(`[canister] Restored DXY state from canister: ${currentDXYBias}`);
+  } catch (err) {
+    console.warn('[canister] restoreDxyStateFromCanister failed:', err.message);
+  }
+}
+
+async function pushPaperSignalsToCanister(signals) {
+  if (!canisterActor || !signals || signals.length === 0) return;
+  try {
+    const batch = signals.slice(-100).map(s => ({
+      pair: s.pair || '',
+      direction: s.direction || 'BUY',
+      entryPrice: s.entryPrice || 0,
+      sl: s.stopLoss || s.sl || 0,
+      tp: s.takeProfit || s.tp || 0,
+      confidence: s.confidence || 0,
+      timestamp: BigInt(Math.round((s.timestamp || Date.now()) * 1_000_000)),
+      smcPatterns: s.smcPatterns || [],
+    }));
+    const result = await canisterActor.pushPaperSignals(batch);
+    if (result && result.err) console.warn('[canister] pushPaperSignals rejected:', result.err);
+    else console.log('[canister] Pushed', batch.length, 'paper signals');
+  } catch (err) {
+    console.warn('[canister] pushPaperSignalsToCanister failed:', err.message);
+  }
+}
+
+async function restorePaperSignalsFromCanister() {
+  if (!canisterActor || paperSignalsBuffer.length > 50) return;
+  try {
+    const result = await canisterActor.getPaperSignals();
+    if (!result || result.err) return;
+    const canisterSignals = Array.isArray(result.ok) ? result.ok : [];
+    let merged = 0;
+    for (const ps of canisterSignals.slice(-200)) {
+      const key = `${ps.pair}:${String(ps.timestamp)}`;
+      if (!paperSignalsBuffer.some(s => `${s.pair}:${s.timestamp}` === key)) {
+        paperSignalsBuffer.push(ps);
+        merged++;
+      }
+    }
+    if (merged > 0) { console.log(`[canister] Restored ${merged} paper signals`); savePaperSignals(); }
+  } catch (err) {
+    console.warn('[canister] restorePaperSignalsFromCanister failed:', err.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Rate limiters — L8
 // ---------------------------------------------------------------------------
 const publicLimiter = rateLimit({
@@ -1770,20 +2000,27 @@ app.listen(PORT, () => {
   setInterval(runCollectionWithSMC, 15 * 60 * 1000);
 
   // DXY initial fetch (background, non-blocking)
+  // CHANGE 7: restore DXY from canister if initial fetch fails
   smcEngine.fetchDXYData()
     .then(data => {
       currentDXYBias   = smcEngine.calculateDXYTrend(data);
       dxyLastFetchedAt = new Date().toISOString();
       console.log(`[DXY] Initial trend: ${currentDXYBias}`);
     })
-    .catch(err => console.warn('[DXY] Initial fetch failed:', err.message));
+    .catch(async err => {
+      console.warn('[DXY] Initial fetch failed:', err.message);
+      await restoreDxyStateFromCanister();
+    });
 
   // Economic calendar — start immediately, then every hour
   fetchCalendar();
   setInterval(fetchCalendar, CALENDAR_CACHE_TTL);
 
-  // Dukascopy backfill — non-blocking background job
-  setImmediate(() => runDukascopyBackfill());
+  // CHANGE 3: restore resolved outcomes before starting backfill
+  // (separate from the main canister init block below to guarantee ordering)
+  initCanisterActor().then(() => restoreResolvedOutcomesFromCanister()).then(() => {
+    setImmediate(() => runDukascopyBackfill());
+  }).catch(err => console.error('[startup] Failed to restore outcomes before backfill:', err.message));
 
   // Intelligence profile — first calculation after 2 minutes (allow backfill to run),
   // then recalculate every 6 hours (was 30 days — fresher volatility regime)
@@ -1793,9 +2030,14 @@ app.listen(PORT, () => {
   // Resolve any paper signals that passed their 24h window during the previous session
   setTimeout(() => resolveOldSignals(), 5 * 1000);
 
-  // C1 — initialise canister actor on startup, then seed ensemble scorer from canister
+  // CHANGE 4: C1 — initialise canister actor on startup, then seed ensemble scorer from canister
+  // (this is the main init block — backfill has its own separate initCanisterActor call above)
   initCanisterActor().then(async () => {
     await restoreResolvedOutcomesFromCanister();
+    await restoreModelStateFromCanister();
+    await restoreIntelligenceProfilesFromCanister();
+    await restoreDxyStateFromCanister();
+    await restorePaperSignalsFromCanister();
     // NEW-H6: seed ensemble scorer from resolved signals already in the buffer
     // If resolved signals were restored from disk, init immediately — no cold start
     if (resolvedSignalsBuffer.length >= 100) {
