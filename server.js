@@ -897,7 +897,7 @@ async function runDukascopyBackfill() {
           });
           yearSuccess = true;
         } catch (fetchErr) {
-          console.error(`[backfill] ${pair} / ${year}: attempt ${yearAttempts} failed: ${fetchErr?.message ?? String(fetchErr)}`);
+          console.error(`[backfill] ${pair} / ${year}: attempt ${yearAttempts} failed: ${fetchErr?.message ?? JSON.stringify(fetchErr)}`);
           if (yearAttempts < 3) {
             console.log(`[backfill] ${pair} / ${year}: retrying in 12s...`);
             await new Promise(r => setTimeout(r, 12000));
