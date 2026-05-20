@@ -90,10 +90,12 @@ let intelligenceLastCalculated  = null;
 // ---------------------------------------------------------------------------
 let currentDXYBias   = 'NEUTRAL'; // updated by background DXY refresh
 let dxyLastFetchedAt = null;
+let dxyCache         = null;
 
 // Paper signals buffer (up to 500 entries)
 const PAPER_SIGNALS_MAX = 500;
 let paperSignalsBuffer = [];
+let paperSignalsPushCounter = 0;
 
 // Resolved signals buffer for ensemble retraining
 // Each entry: { features: number[], outcome: bool }
@@ -189,73 +191,67 @@ const backendIDL = ({ IDL }) => {
       })), err: IDL.Text })],
       []
     ),
-    // --- NEW: model state, intelligence profiles, DXY state, paper signals ---
-    pushModelState: IDL.Func(
-      [IDL.Record({
+    pushModelState: IDL.Func([IDL.Record({
+      weights: IDL.Vec(IDL.Float64),
+      bias: IDL.Float64,
+      means: IDL.Vec(IDL.Float64),
+      stds: IDL.Vec(IDL.Float64),
+      oosAccuracy: IDL.Float64,
+      trainedAt: IDL.Int
+    })], [IDL.Variant({ ok: IDL.Null, err: IDL.Text })], []),
+    getModelState: IDL.Func([], [IDL.Variant({
+      ok: IDL.Opt(IDL.Record({
         weights: IDL.Vec(IDL.Float64),
         bias: IDL.Float64,
         means: IDL.Vec(IDL.Float64),
         stds: IDL.Vec(IDL.Float64),
         oosAccuracy: IDL.Float64,
-        trainedAt: IDL.Int,
-      })],
-      [IDL.Variant({ ok: IDL.Null, err: IDL.Text })],
-      []
-    ),
-    getModelState: IDL.Func(
-      [],
-      [IDL.Variant({ ok: IDL.Opt(IDL.Record({
-        weights: IDL.Vec(IDL.Float64),
-        bias: IDL.Float64,
-        means: IDL.Vec(IDL.Float64),
-        stds: IDL.Vec(IDL.Float64),
-        oosAccuracy: IDL.Float64,
-        trainedAt: IDL.Int,
-      })), err: IDL.Text })],
-      ['query']
-    ),
-    pushIntelligenceProfiles: IDL.Func(
-      [IDL.Vec(IDL.Record({
+        trainedAt: IDL.Int
+      })),
+      err: IDL.Text
+    })], []),
+    pushIntelligenceProfiles: IDL.Func([IDL.Vec(IDL.Record({
+      pair: IDL.Text,
+      volatilityRegime: IDL.Text,
+      adxClass: IDL.Text,
+      sessionQuality: IDL.Float64,
+      updatedAt: IDL.Int
+    }))], [IDL.Variant({ ok: IDL.Null, err: IDL.Text })], []),
+    getIntelligenceProfiles: IDL.Func([], [IDL.Variant({
+      ok: IDL.Vec(IDL.Record({
         pair: IDL.Text,
         volatilityRegime: IDL.Text,
         adxClass: IDL.Text,
         sessionQuality: IDL.Float64,
-        updatedAt: IDL.Int,
-      }))],
-      [IDL.Variant({ ok: IDL.Null, err: IDL.Text })],
-      []
-    ),
-    getIntelligenceProfiles: IDL.Func(
-      [],
-      [IDL.Variant({ ok: IDL.Vec(IDL.Record({
-        pair: IDL.Text,
-        volatilityRegime: IDL.Text,
-        adxClass: IDL.Text,
-        sessionQuality: IDL.Float64,
-        updatedAt: IDL.Int,
-      })), err: IDL.Text })],
-      ['query']
-    ),
-    pushDxyState: IDL.Func(
-      [IDL.Record({
+        updatedAt: IDL.Int
+      })),
+      err: IDL.Text
+    })], []),
+    pushDxyState: IDL.Func([IDL.Record({
+      trend: IDL.Text,
+      dataPoints: IDL.Vec(IDL.Float64),
+      fetchedAt: IDL.Int
+    })], [IDL.Variant({ ok: IDL.Null, err: IDL.Text })], []),
+    getDxyState: IDL.Func([], [IDL.Variant({
+      ok: IDL.Opt(IDL.Record({
         trend: IDL.Text,
         dataPoints: IDL.Vec(IDL.Float64),
-        fetchedAt: IDL.Int,
-      })],
-      [IDL.Variant({ ok: IDL.Null, err: IDL.Text })],
-      []
-    ),
-    getDxyState: IDL.Func(
-      [],
-      [IDL.Variant({ ok: IDL.Opt(IDL.Record({
-        trend: IDL.Text,
-        dataPoints: IDL.Vec(IDL.Float64),
-        fetchedAt: IDL.Int,
-      })), err: IDL.Text })],
-      ['query']
-    ),
-    pushPaperSignals: IDL.Func(
-      [IDL.Vec(IDL.Record({
+        fetchedAt: IDL.Int
+      })),
+      err: IDL.Text
+    })], []),
+    pushPaperSignals: IDL.Func([IDL.Vec(IDL.Record({
+      pair: IDL.Text,
+      direction: IDL.Text,
+      entryPrice: IDL.Float64,
+      sl: IDL.Float64,
+      tp: IDL.Float64,
+      confidence: IDL.Float64,
+      timestamp: IDL.Int,
+      smcPatterns: IDL.Vec(IDL.Text)
+    }))], [IDL.Variant({ ok: IDL.Null, err: IDL.Text })], []),
+    getPaperSignals: IDL.Func([], [IDL.Variant({
+      ok: IDL.Vec(IDL.Record({
         pair: IDL.Text,
         direction: IDL.Text,
         entryPrice: IDL.Float64,
@@ -263,25 +259,10 @@ const backendIDL = ({ IDL }) => {
         tp: IDL.Float64,
         confidence: IDL.Float64,
         timestamp: IDL.Int,
-        smcPatterns: IDL.Vec(IDL.Text),
-      }))],
-      [IDL.Variant({ ok: IDL.Null, err: IDL.Text })],
-      []
-    ),
-    getPaperSignals: IDL.Func(
-      [],
-      [IDL.Variant({ ok: IDL.Vec(IDL.Record({
-        pair: IDL.Text,
-        direction: IDL.Text,
-        entryPrice: IDL.Float64,
-        sl: IDL.Float64,
-        tp: IDL.Float64,
-        confidence: IDL.Float64,
-        timestamp: IDL.Int,
-        smcPatterns: IDL.Vec(IDL.Text),
-      })), err: IDL.Text })],
-      ['query']
-    ),
+        smcPatterns: IDL.Vec(IDL.Text)
+      })),
+      err: IDL.Text
+    })], []),
   });
 };
 
@@ -633,6 +614,7 @@ async function runCollection() {
   lastCollectionError = null;
 
   // M3: Record the oldest recent candle timestamp per pair to protect historical data
+  if (!candleStore.pairs) candleStore.pairs = {};
   const historicalCutoff = {};
   for (const pair of FOREX_PAIRS) {
     const existing = candleStore.pairs[pair];
@@ -718,6 +700,7 @@ async function runCollection() {
         continue;
       }
 
+      if (!candleStore.pairs) candleStore.pairs = {};
       if (!candleStore.pairs[pair]) candleStore.pairs[pair] = [];
       const map = {};
       for (const c of candleStore.pairs[pair]) map[c.datetime] = c;
@@ -872,8 +855,8 @@ async function runDukascopyBackfill() {
       continue;
     }
 
-    // CHANGE 1: fixed — use candleStore.pairs[pair] not candleStore[pair]
-    const existingCount = ((candleStore.pairs && candleStore.pairs[pair]) || []).length;
+    if (!candleStore.pairs) candleStore.pairs = {};
+    const existingCount = (candleStore.pairs[pair] || []).length;
     if (existingCount > 10000) {
       console.log('[backfill]', pair, 'already has', existingCount, 'candles — skipping');
       continue;
@@ -898,74 +881,85 @@ async function runDukascopyBackfill() {
       // Yield to event loop between each yearly fetch
       await new Promise(r => setImmediate(r));
 
-      // OPTION A: retry each year up to 3 times with 12s backoff on transient failure
-      let yearSucceeded = false;
-      for (let attempt = 1; attempt <= 3; attempt++) {
+      let yearAttempts = 0;
+      let yearSuccess = false;
+      let result = null;
+      while (yearAttempts < 3 && !yearSuccess) {
+        yearAttempts++;
         try {
-          console.log(`[backfill] ${pair} / ${year}: fetching... (attempt ${attempt}/3)`);
-          const result = await getHistoricalRates({
+          console.log(`[backfill] ${pair} / ${year}: fetching... (attempt ${yearAttempts})`);
+          result = await getHistoricalRates({
             instrument: instrument,
             dates:      { from: new Date(yearStart), to: new Date(yearEnd) },
             timeframe:  'h1',
-            format: 'json',
+            format:     'object',
             flushDownloadProgress: false
           });
-
-          const raw = Array.isArray(result) ? result : [];
-          let prev  = null;
-          let kept  = 0;
-
-          for (const row of raw) {
-            // dukascopy-node 'object' format: { timestamp, open, high, low, close, volume }
-            const open  = (row.open  || row.askOpen  || 0) + adjustment;
-            const high  = (row.high  || row.askHigh  || 0) + adjustment;
-            const low   = (row.low   || row.askLow   || 0) + adjustment;
-            const close = (row.close || row.askClose || 0) + adjustment;
-
-            if (!open || !close) continue;
-
-            // Data quality filter: reject candles >20% away from previous close
-            if (prev !== null) {
-              const change = Math.abs(close - prev) / prev;
-              if (change > 0.20) {
-                console.warn(`[backfill] ${pair} outlier rejected: close=${close}, prev=${prev}`);
-                continue;
-              }
-            }
-
-            const ts = row.timestamp
-              ? new Date(row.timestamp).toISOString().slice(0, 19).replace('T', ' ')
-              : null;
-            if (!ts) continue;
-
-            pairCandles.push({ datetime: ts, open, high, low, close });
-            prev = close;
-            kept++;
-          }
-
-          console.log(`[backfill] ${pair} / ${year}: ${kept} candles kept.`);
-          yearSucceeded = true;
-          break; // success — no more retries needed for this year
-        } catch (err) {
-          console.error(`[backfill] ${pair} / ${year}: fetch error (attempt ${attempt}/3):`, err.message || err);
-          if (attempt < 3) {
+          yearSuccess = true;
+        } catch (fetchErr) {
+          console.error(`[backfill] ${pair} / ${year}: attempt ${yearAttempts} failed: ${fetchErr.message}`);
+          if (yearAttempts < 3) {
             console.log(`[backfill] ${pair} / ${year}: retrying in 12s...`);
             await new Promise(r => setTimeout(r, 12000));
           }
         }
       }
 
-      if (!yearSucceeded) {
+      if (!yearSuccess) {
         yearsFailed++;
-        console.error(`[backfill] ${pair} / ${year}: all 3 attempts failed.`);
+        console.error(`[backfill] ${pair} / ${year}: all ${yearAttempts} attempts failed.`);
         if (yearsFailed >= 3) {
-          console.error(`[backfill] ${pair}: too many year failures (${yearsFailed}), skipping pair.`);
+          console.error(`[backfill] ${pair}: too many year failures, skipping pair.`);
+          break;
+        }
+        continue;
+      }
+
+      try {
+        const raw = Array.isArray(result) ? result : [];
+        let prev  = null;
+        let kept  = 0;
+
+        for (const row of raw) {
+          // dukascopy-node 'object' format: { timestamp, open, high, low, close, volume }
+          const open  = (row.open  || row.askOpen  || 0) + adjustment;
+          const high  = (row.high  || row.askHigh  || 0) + adjustment;
+          const low   = (row.low   || row.askLow   || 0) + adjustment;
+          const close = (row.close || row.askClose || 0) + adjustment;
+
+          if (!open || !close) continue;
+
+          // Data quality filter: reject candles >20% away from previous close
+          if (prev !== null) {
+            const change = Math.abs(close - prev) / prev;
+            if (change > 0.20) {
+              console.warn(`[backfill] ${pair} outlier rejected: close=${close}, prev=${prev}`);
+              continue;
+            }
+          }
+
+          const ts = row.timestamp
+            ? new Date(row.timestamp).toISOString().slice(0, 19).replace('T', ' ')
+            : null;
+          if (!ts) continue;
+
+          pairCandles.push({ datetime: ts, open, high, low, close });
+          prev = close;
+          kept++;
+        }
+
+        console.log(`[backfill] ${pair} / ${year}: ${kept} candles kept.`);
+      } catch (err) {
+        yearsFailed++;
+        console.error(`[backfill] ${pair} / ${year}: processing error: ${err.message}`);
+        if (yearsFailed >= 3) {
+          console.error(`[backfill] ${pair}: too many year failures, skipping pair.`);
           break;
         }
       }
 
       // Small pause between yearly batches to avoid hammering Dukascopy
-      await new Promise(r => setTimeout(r, 2000));
+      await new Promise(r => setTimeout(r, 500));
     }
 
     if (pairCandles.length === 0) {
@@ -975,6 +969,7 @@ async function runDukascopyBackfill() {
     }
 
     // Merge with existing candleStore (no cap — deep history store)
+    if (!candleStore.pairs) candleStore.pairs = {};
     if (!candleStore.pairs[pair]) candleStore.pairs[pair] = [];
     const mapByDt = {};
     for (const c of candleStore.pairs[pair]) mapByDt[c.datetime] = c;
@@ -1227,20 +1222,11 @@ async function calculateIntelligenceProfile() {
   try {
     atomicWriteJSON(INTELLIGENCE_PROFILE_PATH, profile);
     console.log('[intelligence] Profile saved to disk.');
-
-    // CHANGE 8: push intelligence profiles to canister after saving
-    canisterActor && canisterActor.pushIntelligenceProfiles(
-      FOREX_PAIRS.map(pair => ({
-        pair,
-        volatilityRegime: profile[pair]?.volatilityRegime || 'normal',
-        adxClass: 'UNKNOWN',
-        sessionQuality: 0.5,
-        updatedAt: BigInt(Date.now()),
-      }))
-    ).catch(err => console.warn('[canister] Intelligence profile push failed:', err.message));
   } catch (err) {
     console.error('[intelligence] Failed to persist profile:', err.message);
   }
+
+  pushIntelligenceProfilesToCanister(intelligenceProfile).catch(() => {});
 }
 
 // ---------------------------------------------------------------------------
@@ -1252,13 +1238,12 @@ async function runSMCEvaluation() {
     const dxyData = await smcEngine.fetchDXYData();
     currentDXYBias   = smcEngine.calculateDXYTrend(dxyData);
     dxyLastFetchedAt = new Date().toISOString();
-
-    // CHANGE 6: push DXY state to canister after successful fetch
-    canisterActor && canisterActor.pushDxyState({
+    dxyCache = {
       trend: currentDXYBias,
-      dataPoints: Array.isArray(dxyData) ? dxyData : [],
-      fetchedAt: BigInt(Date.now()),
-    }).catch(err => console.warn('[canister] DXY state push failed:', err.message));
+      dataPoints: dxyData && Array.isArray(dxyData) ? dxyData.map(d => d.close || d.value || 0).slice(-50) : [],
+      fetchedAt: Date.now()
+    };
+    pushDxyStateToCanister(dxyCache).catch(() => {});
   } catch (err) {
     // BUG-M13: log DXY staleness when fetch fails
     const staleSecs = dxyLastFetchedAt ? Math.round((Date.now() - new Date(dxyLastFetchedAt).getTime()) / 1000) : null;
@@ -1268,6 +1253,7 @@ async function runSMCEvaluation() {
 
   const killzone = smcEngine.isInsideKillzone();
 
+  if (!candleStore.pairs) candleStore.pairs = {};
   for (const pair of FOREX_PAIRS) {
     try {
       const candles = candleStore.pairs[pair];
@@ -1389,8 +1375,8 @@ async function runSMCEvaluation() {
             console.log('[paper] Buffer full (500), dropping oldest signal:', dropped && dropped.id);
           }
           paperSignalsBuffer.push(paperSignal);
-          // CHANGE 9: periodic paper signals push to canister
-          if (paperSignalsBuffer.length % 10 === 0) {
+          paperSignalsPushCounter++;
+          if (paperSignalsPushCounter % 10 === 0) {
             pushPaperSignalsToCanister(paperSignalsBuffer).catch(() => {});
           }
           console.log(`[SMC] LIVE demoted to PAPER (ensembleScore=${ensembleScore}): ${pair} ${candidateDirection}`);
@@ -1416,8 +1402,8 @@ async function runSMCEvaluation() {
           console.log('[paper] Buffer full (500), dropping oldest signal:', dropped && dropped.id);
         }
         paperSignalsBuffer.push(paperSignal);
-        // CHANGE 9: periodic paper signals push to canister
-        if (paperSignalsBuffer.length % 10 === 0) {
+        paperSignalsPushCounter++;
+        if (paperSignalsPushCounter % 10 === 0) {
           pushPaperSignalsToCanister(paperSignalsBuffer).catch(() => {});
         }
         console.log(`[SMC] PAPER signal: ${pair} ${candidateDirection} (${classification}) — stored in memory buffer only, NOT pushed to canister`);
@@ -1438,8 +1424,8 @@ async function runSMCEvaluation() {
             console.log('[paper] Buffer full (500), dropping oldest signal:', dropped && dropped.id);
           }
           paperSignalsBuffer.push(paperSignal);
-          // CHANGE 9: periodic paper signals push to canister
-          if (paperSignalsBuffer.length % 10 === 0) {
+          paperSignalsPushCounter++;
+          if (paperSignalsPushCounter % 10 === 0) {
             pushPaperSignalsToCanister(paperSignalsBuffer).catch(() => {});
           }
           console.log(`[SMC] STANDARD demoted to PAPER (ensembleScore=${ensembleScore}): ${pair} ${candidateDirection}`);
@@ -1528,6 +1514,7 @@ async function pushSignalToCanister(signal) {
     const smcZones = signal.smcZones || {};
     const obZone  = signal.obZone  || smcZones.orderBlock  || {};
     const fvgZone = signal.fvgZone || smcZones.fvg || {};
+    if (!candleStore.pairs) candleStore.pairs = {};
     const _candles = candleStore.pairs[signal.pair];
     if (!_candles || _candles.length < 15) {
       console.warn(`[canister] Skipping signal push for ${signal.pair}: insufficient candles for ATR`);
@@ -1685,96 +1672,178 @@ async function restoreResolvedOutcomesFromCanister() {
   }
 }
 
-// ---------------------------------------------------------------------------
-// CHANGE 5: New canister restore/push helper functions
-// ---------------------------------------------------------------------------
-
-async function restoreModelStateFromCanister() {
+async function pushModelStateToCanister(modelState) {
   if (!canisterActor) return;
   try {
+    const payload = {
+      weights: modelState.weights || [],
+      bias: modelState.bias || 0,
+      means: modelState.means || [],
+      stds: modelState.stds || [],
+      oosAccuracy: modelState.oosAccuracy || 0,
+      trainedAt: BigInt(modelState.trainedAt || Date.now())
+    };
+    const result = await canisterActor.pushModelState(payload);
+    if ('ok' in result) {
+      console.log('[canister] Model state pushed');
+    } else {
+      console.warn('[canister] pushModelState err:', result.err);
+    }
+  } catch (e) {
+    console.warn('[canister] pushModelState failed:', e.message);
+  }
+}
+
+async function restoreModelStateFromCanister() {
+  if (!canisterActor) return null;
+  try {
     const result = await canisterActor.getModelState();
-    if (!result || result.err) return;
-    const modelState = result.ok && result.ok.length > 0 ? result.ok[0] : null;
-    if (!modelState) return;
-    ensembleScorer.importModelState(modelState);
-    console.log('[canister] Restored model state from canister');
-  } catch (err) {
-    console.warn('[canister] restoreModelStateFromCanister failed:', err.message || err);
+    if ('ok' in result && result.ok.length > 0) {
+      const state = result.ok[0];
+      console.log('[canister] Model state restored from canister');
+      return {
+        weights: Array.from(state.weights),
+        bias: state.bias,
+        means: Array.from(state.means),
+        stds: Array.from(state.stds),
+        oosAccuracy: state.oosAccuracy,
+        trainedAt: Number(state.trainedAt)
+      };
+    }
+  } catch (e) {
+    console.warn('[canister] restoreModelState failed:', e.message);
+  }
+  return null;
+}
+
+async function pushIntelligenceProfilesToCanister(profiles) {
+  if (!canisterActor || !profiles || !Object.keys(profiles).length) return;
+  try {
+    const payload = Object.entries(profiles).map(([pair, p]) => ({
+      pair,
+      volatilityRegime: p.volatilityRegime || 'normal',
+      adxClass: p.adxClass || 'ranging',
+      sessionQuality: p.sessionQuality || 0.5,
+      updatedAt: BigInt(p.updatedAt || Date.now())
+    }));
+    const result = await canisterActor.pushIntelligenceProfiles(payload);
+    if ('ok' in result) {
+      console.log('[canister] Intelligence profiles pushed:', payload.length, 'pairs');
+    } else {
+      console.warn('[canister] pushIntelligenceProfiles err:', result.err);
+    }
+  } catch (e) {
+    console.warn('[canister] pushIntelligenceProfiles failed:', e.message);
   }
 }
 
 async function restoreIntelligenceProfilesFromCanister() {
-  if (!canisterActor || intelligenceProfile) return;
+  if (!canisterActor) return null;
   try {
     const result = await canisterActor.getIntelligenceProfiles();
-    if (!result || result.err) return;
-    const profiles = Array.isArray(result.ok) ? result.ok : [];
-    if (profiles.length === 0) return;
-    const restored = { _calculatedAt: new Date().toISOString() };
-    for (const cp of profiles) {
-      restored[cp.pair] = { volatilityRegime: cp.volatilityRegime || 'normal', status: 'active' };
+    if ('ok' in result && result.ok.length > 0) {
+      const profiles = {};
+      for (const p of result.ok) {
+        profiles[p.pair] = {
+          volatilityRegime: p.volatilityRegime,
+          adxClass: p.adxClass,
+          sessionQuality: p.sessionQuality,
+          updatedAt: Number(p.updatedAt)
+        };
+      }
+      console.log('[canister] Intelligence profiles restored:', Object.keys(profiles).length, 'pairs');
+      return profiles;
     }
-    intelligenceProfile = restored;
-    console.log('[canister] Restored intelligence profiles from canister');
-  } catch (err) {
-    console.warn('[canister] restoreIntelligenceProfilesFromCanister failed:', err.message);
+  } catch (e) {
+    console.warn('[canister] restoreIntelligenceProfiles failed:', e.message);
+  }
+  return null;
+}
+
+async function pushDxyStateToCanister(dxyState) {
+  if (!canisterActor || !dxyState) return;
+  try {
+    const payload = {
+      trend: dxyState.trend || 'neutral',
+      dataPoints: (dxyState.dataPoints || []).map(Number),
+      fetchedAt: BigInt(dxyState.fetchedAt || Date.now())
+    };
+    const result = await canisterActor.pushDxyState(payload);
+    if ('ok' in result) {
+      console.log('[canister] DXY state pushed, trend:', dxyState.trend);
+    } else {
+      console.warn('[canister] pushDxyState err:', result.err);
+    }
+  } catch (e) {
+    console.warn('[canister] pushDxyState failed:', e.message);
   }
 }
 
 async function restoreDxyStateFromCanister() {
-  if (!canisterActor) return;
+  if (!canisterActor) return null;
   try {
     const result = await canisterActor.getDxyState();
-    if (!result || result.err) return;
-    const dxyState = result.ok && result.ok.length > 0 ? result.ok[0] : null;
-    if (!dxyState) return;
-    currentDXYBias = dxyState.trend || 'NEUTRAL';
-    dxyLastFetchedAt = new Date(Number(dxyState.fetchedAt)).toISOString();
-    console.log(`[canister] Restored DXY state from canister: ${currentDXYBias}`);
-  } catch (err) {
-    console.warn('[canister] restoreDxyStateFromCanister failed:', err.message);
+    if ('ok' in result && result.ok.length > 0) {
+      const state = result.ok[0];
+      console.log('[canister] DXY state restored from canister, trend:', state.trend);
+      return {
+        trend: state.trend,
+        dataPoints: Array.from(state.dataPoints).map(Number),
+        fetchedAt: Number(state.fetchedAt)
+      };
+    }
+  } catch (e) {
+    console.warn('[canister] restoreDxyState failed:', e.message);
   }
+  return null;
 }
 
-async function pushPaperSignalsToCanister(signals) {
-  if (!canisterActor || !signals || signals.length === 0) return;
+async function pushPaperSignalsToCanister(paperSignals) {
+  if (!canisterActor || !paperSignals || !paperSignals.length) return;
   try {
-    const batch = signals.slice(-100).map(s => ({
+    const payload = paperSignals.slice(-200).map(s => ({
       pair: s.pair || '',
-      direction: s.direction || 'BUY',
+      direction: s.direction || 'Buy',
       entryPrice: s.entryPrice || 0,
-      sl: s.stopLoss || s.sl || 0,
-      tp: s.takeProfit || s.tp || 0,
+      sl: s.sl || 0,
+      tp: s.tp || 0,
       confidence: s.confidence || 0,
-      timestamp: BigInt(Math.round((s.timestamp || Date.now()) * 1_000_000)),
-      smcPatterns: s.smcPatterns || [],
+      timestamp: BigInt(s.timestamp || Date.now()),
+      smcPatterns: s.smcPatterns || []
     }));
-    const result = await canisterActor.pushPaperSignals(batch);
-    if (result && result.err) console.warn('[canister] pushPaperSignals rejected:', result.err);
-    else console.log('[canister] Pushed', batch.length, 'paper signals');
-  } catch (err) {
-    console.warn('[canister] pushPaperSignalsToCanister failed:', err.message);
+    const result = await canisterActor.pushPaperSignals(payload);
+    if ('ok' in result) {
+      console.log('[canister] Paper signals pushed:', payload.length);
+    } else {
+      console.warn('[canister] pushPaperSignals err:', result.err);
+    }
+  } catch (e) {
+    console.warn('[canister] pushPaperSignals failed:', e.message);
   }
 }
 
 async function restorePaperSignalsFromCanister() {
-  if (!canisterActor || paperSignalsBuffer.length > 50) return;
+  if (!canisterActor) return null;
   try {
     const result = await canisterActor.getPaperSignals();
-    if (!result || result.err) return;
-    const canisterSignals = Array.isArray(result.ok) ? result.ok : [];
-    let merged = 0;
-    for (const ps of canisterSignals.slice(-200)) {
-      const key = `${ps.pair}:${String(ps.timestamp)}`;
-      if (!paperSignalsBuffer.some(s => `${s.pair}:${s.timestamp}` === key)) {
-        paperSignalsBuffer.push(ps);
-        merged++;
-      }
+    if ('ok' in result && result.ok.length > 0) {
+      const signals = result.ok.map(s => ({
+        pair: s.pair,
+        direction: s.direction,
+        entryPrice: s.entryPrice,
+        sl: s.sl,
+        tp: s.tp,
+        confidence: s.confidence,
+        timestamp: Number(s.timestamp),
+        smcPatterns: Array.from(s.smcPatterns)
+      }));
+      console.log('[canister] Paper signals restored from canister:', signals.length);
+      return signals;
     }
-    if (merged > 0) { console.log(`[canister] Restored ${merged} paper signals`); savePaperSignals(); }
-  } catch (err) {
-    console.warn('[canister] restorePaperSignalsFromCanister failed:', err.message);
+  } catch (e) {
+    console.warn('[canister] restorePaperSignals failed:', e.message);
   }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1836,6 +1905,7 @@ app.get('/smc-status', (req, res) => {
     const dxyCache  = smcEngine.getDXYCache();
     const activePairs = {};
 
+    if (!candleStore.pairs) candleStore.pairs = {};
     for (const pair of FOREX_PAIRS) {
       const candles = candleStore.pairs[pair];
       if (!candles || candles.length < 50) {
@@ -1897,6 +1967,7 @@ app.get('/stored-history', requireSecret, publicLimiter, (req, res) => {
     return res.status(400).json({ error: 'Limit must be a positive integer' });
   }
   const limit = (rawLimit > 0) ? Math.min(rawLimit, 5000) : 5000;
+  if (!candleStore.pairs) candleStore.pairs = {};
   const limited = { pairs: {} };
   for (const pair of Object.keys(candleStore.pairs)) {
     limited.pairs[pair] = candleStore.pairs[pair].slice(-limit);
@@ -1932,6 +2003,7 @@ app.get('/intelligence', (req, res) => {
 
 app.get('/status', publicLimiter, (req, res) => {
   cors(res);
+  if (!candleStore.pairs) candleStore.pairs = {};
   const storeCounts = {};
   for (const pair of FOREX_PAIRS) {
     storeCounts[pair] = (candleStore.pairs[pair] || []).length;
@@ -2000,27 +2072,26 @@ app.listen(PORT, () => {
   setInterval(runCollectionWithSMC, 15 * 60 * 1000);
 
   // DXY initial fetch (background, non-blocking)
-  // CHANGE 7: restore DXY from canister if initial fetch fails
   smcEngine.fetchDXYData()
     .then(data => {
       currentDXYBias   = smcEngine.calculateDXYTrend(data);
       dxyLastFetchedAt = new Date().toISOString();
+      dxyCache = {
+        trend: currentDXYBias,
+        dataPoints: data && Array.isArray(data) ? data.map(d => d.close || d.value || 0).slice(-50) : [],
+        fetchedAt: Date.now()
+      };
+      pushDxyStateToCanister(dxyCache).catch(() => {});
       console.log(`[DXY] Initial trend: ${currentDXYBias}`);
     })
-    .catch(async err => {
-      console.warn('[DXY] Initial fetch failed:', err.message);
-      await restoreDxyStateFromCanister();
-    });
+    .catch(err => console.warn('[DXY] Initial fetch failed:', err.message));
 
   // Economic calendar — start immediately, then every hour
   fetchCalendar();
   setInterval(fetchCalendar, CALENDAR_CACHE_TTL);
 
-  // CHANGE 3: restore resolved outcomes before starting backfill
-  // (separate from the main canister init block below to guarantee ordering)
-  initCanisterActor().then(() => restoreResolvedOutcomesFromCanister()).then(() => {
-    setImmediate(() => runDukascopyBackfill());
-  }).catch(err => console.error('[startup] Failed to restore outcomes before backfill:', err.message));
+  // Dukascopy backfill — non-blocking background job
+  setImmediate(() => runDukascopyBackfill());
 
   // Intelligence profile — first calculation after 2 minutes (allow backfill to run),
   // then recalculate every 6 hours (was 30 days — fresher volatility regime)
@@ -2030,19 +2101,20 @@ app.listen(PORT, () => {
   // Resolve any paper signals that passed their 24h window during the previous session
   setTimeout(() => resolveOldSignals(), 5 * 1000);
 
-  // CHANGE 4: C1 — initialise canister actor on startup, then seed ensemble scorer from canister
-  // (this is the main init block — backfill has its own separate initCanisterActor call above)
+  // C1 — initialise canister actor on startup, then seed ensemble scorer from canister
   initCanisterActor().then(async () => {
     await restoreResolvedOutcomesFromCanister();
-    await restoreModelStateFromCanister();
-    await restoreIntelligenceProfilesFromCanister();
-    await restoreDxyStateFromCanister();
-    await restorePaperSignalsFromCanister();
+    restoreModelStateFromCanister().then(state => { if (state && ensembleScorer) ensembleScorer.loadRemoteState(state); });
+    restoreIntelligenceProfilesFromCanister().then(profiles => { if (profiles) { if (!intelligenceProfile) intelligenceProfile = {}; Object.assign(intelligenceProfile, profiles); } });
+    restoreDxyStateFromCanister().then(state => { if (state) { dxyCache = state; } });
+    restorePaperSignalsFromCanister().then(signals => { if (signals && signals.length) { paperSignalsBuffer.push(...signals.filter(s => !paperSignalsBuffer.find(e => e.timestamp === s.timestamp))); } });
     // NEW-H6: seed ensemble scorer from resolved signals already in the buffer
     // If resolved signals were restored from disk, init immediately — no cold start
     if (resolvedSignalsBuffer.length >= 100) {
       console.log(`[Ensemble] Seeding from ${resolvedSignalsBuffer.length} restored resolved signals...`);
       ensembleScorer.initEnsembleScorer(resolvedSignalsBuffer);
+      const modelState = ensembleScorer.getModelState ? ensembleScorer.getModelState() : { weights: [], bias: 0, means: [], stds: [], oosAccuracy: 0, trainedAt: Date.now() };
+      pushModelStateToCanister(modelState).catch(() => {});
     } else {
       console.log('[Ensemble] Insufficient resolved signals on startup (' + resolvedSignalsBuffer.length + '). Model will activate once 100+ outcomes are available.');
     }
@@ -2050,7 +2122,11 @@ app.listen(PORT, () => {
 
   // H1 — retrain ensemble model daily
   setInterval(() => {
-    try { ensembleScorer.retrainIfNeeded(resolvedSignalsBuffer); }
+    try {
+      ensembleScorer.retrainIfNeeded(resolvedSignalsBuffer);
+      const modelState = ensembleScorer.getModelState ? ensembleScorer.getModelState() : { weights: [], bias: 0, means: [], stds: [], oosAccuracy: 0, trainedAt: Date.now() };
+      pushModelStateToCanister(modelState).catch(() => {});
+    }
     catch (e) { console.error('[ensemble] Retrain interval error:', e.message); }
   }, 24 * 60 * 60 * 1000);
 });
