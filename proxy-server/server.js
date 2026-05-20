@@ -18,9 +18,11 @@ const API_KEY        = process.env.TWELVEDATA_API_KEY;
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
 const PROXY_SECRET   = process.env.PROXY_SECRET || '';
 
-// L9 — warn immediately if PROXY_SECRET is missing
+// SEC-H3 — warn immediately if PROXY_SECRET is missing; block all authenticated calls
+let _proxySecretMissing = false;
 if (!process.env.PROXY_SECRET) {
-  console.error('CRITICAL WARNING: PROXY_SECRET is not set — all endpoints are unprotected!');
+  _proxySecretMissing = true;
+  console.error('CRITICAL WARNING: PROXY_SECRET is not set — all authenticated endpoints will reject all requests until PROXY_SECRET is configured!');
 }
 
 // ---------------------------------------------------------------------------
@@ -221,8 +223,10 @@ function incrementCallCount() {
 
 /**
  * Timing-safe secret comparison to prevent timing attacks.
+ * SEC-H3: returns false immediately if PROXY_SECRET is not configured.
  */
 function secretMatches(provided) {
+  if (_proxySecretMissing) return false; // SEC-H3: no secret configured — block all
   if (!PROXY_SECRET || !provided) return false;
   try {
     const a = Buffer.from(PROXY_SECRET, 'utf8');
@@ -235,11 +239,18 @@ function secretMatches(provided) {
 }
 
 /**
- * CORS — uses ALLOWED_ORIGIN env var only; no wildcard fallback.
+ * CORS — uses ALLOWED_ORIGIN env var only.
+ * SEC-H2: if ALLOWED_ORIGIN is not set, no Access-Control-Allow-Origin header is set,
+ * which means browsers will block all cross-origin requests (same as blocking all origins).
+ * A startup warning is logged so the operator is aware.
  */
+if (!process.env.ALLOWED_ORIGIN) {
+  console.warn('WARNING: ALLOWED_ORIGIN is not set — all browser cross-origin requests will be blocked by CORS.');
+}
 function cors(res) {
   const origin = process.env.ALLOWED_ORIGIN;
   if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
+  // If no origin is set, no CORS header is emitted — browsers block cross-origin calls (SEC-H2)
 }
 // C4 — CORS OPTIONS preflight handler (must come before all routes)
 app.options('*', (req, res) => {
@@ -301,7 +312,8 @@ try {
     const raw = fs.readFileSync(INTELLIGENCE_PROFILE_PATH, 'utf8');
     intelligenceProfile = JSON.parse(raw);
     intelligenceStatus  = 'active';
-    intelligenceLastCalculated = intelligenceProfile._calculatedAt || null;
+    // NEW-M2: _calculatedAt may be missing in older profile versions — guard with optional chaining
+    intelligenceLastCalculated = intelligenceProfile._calculatedAt ?? null;
     console.log('[startup] Intelligence profile loaded from disk.');
   }
 } catch (err) {
@@ -351,7 +363,7 @@ function resolveOldSignals() {
       // H2: feed resolved paper signal outcome into resolvedSignalsBuffer for model training
       const pairIntel = intelligenceProfile && intelligenceProfile[sig.pair];
       resolvedSignalsBuffer.push({
-        features: ensembleScorer.extractFeatures(sig, pairIntel),
+        features: ensembleScorer.extractFeatures(sig, pairIntel, undefined),
         outcome:  sig.outcome === 'WIN' ? 1 : 0
       });
     }
@@ -586,6 +598,9 @@ async function fetchCalendar() {
   }
 
   // ForexFactory RSS fallback
+  // NEW-M6: check cache age before returning stale data
+  const CALENDAR_STALE_MS = 12 * 60 * 60 * 1000; // 12 hours
+  const cacheAge = calendarCache.fetchedAt ? Date.now() - calendarCache.fetchedAt : Infinity;
   try {
     const rssResponse = await axios.get('https://nfs.faireconomy.media/ff_calendar_thisweek.xml', {
       timeout: 10000
@@ -608,6 +623,13 @@ async function fetchCalendar() {
     console.log(`[calendar] ForexFactory RSS: ${events.length} high-impact events.`);
   } catch (err) {
     console.error('[calendar] ForexFactory RSS fallback failed:', err.message);
+    // NEW-M6: return stale cache only if it is < 12 hours old
+    if (cacheAge < CALENDAR_STALE_MS) {
+      console.warn(`[calendar] Returning stale cache (${Math.round(cacheAge / 60000)} min old).`);
+    } else {
+      console.warn('[calendar] Cache is older than 12 hours — returning empty event list to avoid stale news filter.');
+      calendarCache = { data: [], fetchedAt: calendarCache.fetchedAt };
+    }
   }
 }
 
@@ -782,20 +804,30 @@ function percentile(sorted, p) {
   return sorted[idx];
 }
 
-/** Session for a given UTC datetime string (YYYY-MM-DD HH:MM:SS) */
+/**
+ * Session for a given UTC datetime string (YYYY-MM-DD HH:MM:SS)
+ * NEW-C2: aligned with backend signal_engine.mo session logic:
+ *   Tokyo:    0–8 UTC
+ *   London:   8–12 UTC
+ *   Overlap:  12–17 UTC (London+NY)
+ *   New York: 13–21 UTC
+ *   Sydney:   21–23 UTC and 0–5 UTC
+ */
 function classifySession(datetime) {
   const hour = parseInt(datetime.slice(11, 13), 10);
-  const londonOpen   = hour >= 7  && hour < 12;
-  const nyOpen       = hour >= 12 && hour < 17;
-  const londonNY     = hour >= 12 && hour < 16;
-  const tokyoOpen    = (hour >= 23 || hour < 7);
-  const sydneyOpen   = hour >= 21 && hour < 23;
+  // Sydney spans midnight: hours 21-23 and 0-4
+  const sydneyOpen = hour >= 21 || hour < 5;
+  const tokyoOpen  = hour >= 0  && hour < 8;
+  const londonOpen = hour >= 8  && hour < 12;
+  const overlap    = hour >= 12 && hour < 17;
+  const nyOpen     = hour >= 13 && hour < 21;
 
-  if (londonNY)  return 'londonNY';
-  if (nyOpen)    return 'newYork';
-  if (londonOpen)return 'london';
-  if (tokyoOpen) return 'tokyo';
-  if (sydneyOpen)return 'sydney';
+  // Priority order: overlap > NY > london > tokyo > sydney
+  if (overlap)    return 'londonNY';
+  if (nyOpen)     return 'newYork';
+  if (londonOpen) return 'london';
+  if (tokyoOpen)  return 'tokyo';
+  if (sydneyOpen) return 'sydney';
   return null;
 }
 
@@ -993,7 +1025,10 @@ async function runSMCEvaluation() {
     currentDXYBias   = smcEngine.calculateDXYTrend(dxyData);
     dxyLastFetchedAt = new Date().toISOString();
   } catch (err) {
-    console.error('[SMC] DXY refresh failed:', err.message);
+    // BUG-M13: log DXY staleness when fetch fails
+    const staleSecs = dxyLastFetchedAt ? Math.round((Date.now() - new Date(dxyLastFetchedAt).getTime()) / 1000) : null;
+    const staleMsg  = staleSecs !== null ? ` Current DXY bias (${currentDXYBias}) is ${staleSecs}s old.` : ' No DXY data available yet.';
+    console.warn('[SMC] DXY refresh failed:', err.message + '.' + staleMsg);
   }
 
   const killzone = smcEngine.isInsideKillzone();
@@ -1008,8 +1043,8 @@ async function runSMCEvaluation() {
       const lastRSI   = rsiVals[rsiVals.length - 1];
       if (isNaN(lastRSI)) continue;
 
-      // Adaptive thresholds from intelligence profile if available
-      const pairProfile  = intelligenceProfile && intelligenceProfile[pair];
+      // BUG-M12: null-check intelligenceProfile before ANY use (was checked too late)
+      const pairProfile  = intelligenceProfile ? intelligenceProfile[pair] : null;
       const oversold     = (pairProfile && pairProfile.adaptiveRSI) ? pairProfile.adaptiveRSI.oversold  : 35;
       const overbought   = (pairProfile && pairProfile.adaptiveRSI) ? pairProfile.adaptiveRSI.overbought : 65;
 
@@ -1019,7 +1054,7 @@ async function runSMCEvaluation() {
       if (!candidateDirection) continue;
 
       // H3 — real indicator check: RSI + MACD + ADX from intelligence profile
-      const pairIntel = (typeof intelligenceProfile !== 'undefined' && intelligenceProfile && intelligenceProfile[pair]) || {};
+      const pairIntel = pairProfile || {};
       const rsiForCheck = pairIntel.rsi || lastRSI || 50;
       const macdHist = pairIntel.macdHistogram || 0;
       const adx = pairIntel.adx || 0;
@@ -1046,6 +1081,10 @@ async function runSMCEvaluation() {
         ? Math.min(100, Math.round(60 + (oversold - lastRSI) * 2))
         : Math.min(100, Math.round(60 + (lastRSI - overbought) * 2));
       const adjustedConfidence = Math.max(0, rawConfidence - dxyPenalty);
+
+      // NEW-M5: suppress signals with confidence below minimum threshold after DXY penalty
+      const MIN_CONFIDENCE_THRESHOLD = 10;
+      if (adjustedConfidence < MIN_CONFIDENCE_THRESHOLD) continue;
 
       // ---- Signal type key ----
       const signalTypeKey = smcEngine.computeSignalTypeKey({
@@ -1085,7 +1124,10 @@ async function runSMCEvaluation() {
       let highConviction = false;
       if (classification === 'LIVE' || classification === 'STANDARD') {
         try {
-          const features = ensembleScorer.extractFeatures(signalBase, null);
+          const sweepAge = (sweepResult && sweepResult.sweepCandleIndex != null)
+            ? candles.length - 1 - sweepResult.sweepCandleIndex
+            : undefined;
+          const features = ensembleScorer.extractFeatures(signalBase, null, sweepAge);
           const score    = await ensembleScorer.scoreSignal(features);
           if (score !== null) {
             ensembleScore  = score;
@@ -1107,7 +1149,10 @@ async function runSMCEvaluation() {
             isPaper:     true, // explicit: demoted paper
             paperReason: 'ENSEMBLE_LOW_SCORE'
           };
-          if (paperSignalsBuffer.length >= PAPER_SIGNALS_MAX) paperSignalsBuffer.shift();
+          if (paperSignalsBuffer.length >= PAPER_SIGNALS_MAX) {
+            const dropped = paperSignalsBuffer.shift();
+            console.log('[paper] Buffer full (500), dropping oldest signal:', dropped && dropped.id);
+          }
           paperSignalsBuffer.push(paperSignal);
           console.log(`[SMC] LIVE demoted to PAPER (ensembleScore=${ensembleScore}): ${pair} ${candidateDirection}`);
         } else {
@@ -1127,7 +1172,10 @@ async function runSMCEvaluation() {
       } else if (classification === 'PAPER_OUTSIDE_KILLZONE' || classification === 'PAPER_INDICATOR_FAILED') {
         const paperSignal = { ...signalBase, ensembleScore: null, isPaper: true, paperReason: classification };
         // Buffer paper signals (ring buffer, drop oldest)
-        if (paperSignalsBuffer.length >= PAPER_SIGNALS_MAX) paperSignalsBuffer.shift();
+        if (paperSignalsBuffer.length >= PAPER_SIGNALS_MAX) {
+          const dropped = paperSignalsBuffer.shift();
+          console.log('[paper] Buffer full (500), dropping oldest signal:', dropped && dropped.id);
+        }
         paperSignalsBuffer.push(paperSignal);
         console.log(`[SMC] PAPER signal: ${pair} ${candidateDirection} (${classification}) — stored in memory buffer only, NOT pushed to canister`);
 
@@ -1142,7 +1190,10 @@ async function runSMCEvaluation() {
             isPaper:     true,
             paperReason: 'ENSEMBLE_LOW_SCORE'
           };
-          if (paperSignalsBuffer.length >= PAPER_SIGNALS_MAX) paperSignalsBuffer.shift();
+          if (paperSignalsBuffer.length >= PAPER_SIGNALS_MAX) {
+            const dropped = paperSignalsBuffer.shift();
+            console.log('[paper] Buffer full (500), dropping oldest signal:', dropped && dropped.id);
+          }
           paperSignalsBuffer.push(paperSignal);
           console.log(`[SMC] STANDARD demoted to PAPER (ensembleScore=${ensembleScore}): ${pair} ${candidateDirection}`);
         } else {
@@ -1178,7 +1229,10 @@ async function runSMCEvaluation() {
             fvgZone:               null,
             isFallback:            true
           };
-          const fbFeatures = ensembleScorer.extractFeatures(fallbackBase, null);
+          const fbSweepAge = (sweepResult && sweepResult.sweepCandleIndex != null)
+              ? candles.length - 1 - sweepResult.sweepCandleIndex
+              : undefined;
+            const fbFeatures = ensembleScorer.extractFeatures(fallbackBase, null, fbSweepAge);
           fallbackEnsembleScore  = await ensembleScorer.scoreSignal(fbFeatures);
           fallbackHighConviction = fallbackEnsembleScore !== null && fallbackEnsembleScore >= 75;
         } catch (_) {}
@@ -1507,9 +1561,9 @@ app.listen(PORT, () => {
   // isCollectionRunning guards against concurrent cycles.
   const runCollectionWithSMC = async () => {
     if (isCollectionRunning) {
-      // M5: safety timeout — force reset if stuck > 10 minutes
+      // M5: safety timeout — force reset if stuck >= 10 minutes (was >, off-by-one fixed)
       const elapsed = collectionStartTime ? Date.now() - collectionStartTime : 0;
-      if (elapsed > 10 * 60 * 1000) {
+      if (elapsed >= 10 * 60 * 1000) {
         console.warn('[collection] Safety timeout: force-resetting after', Math.round(elapsed / 1000), 's');
         isCollectionRunning = false;
       } else {
@@ -1524,6 +1578,7 @@ app.listen(PORT, () => {
       await runSMCEvaluation().catch(err => console.error('[SMC] Post-collection evaluation error:', err.message));
     } finally {
       isCollectionRunning = false;
+      collectionStartTime = null; // BUG-H7/NEW-M4: always reset so elapsed never grows monotonically
     }
   };
   runCollectionWithSMC();
@@ -1553,14 +1608,21 @@ app.listen(PORT, () => {
   // Resolve any paper signals that passed their 24h window during the previous session
   setTimeout(() => resolveOldSignals(), 5 * 1000);
 
-  // C1 — initialise canister actor on startup
-  initCanisterActor();
+  // C1 — initialise canister actor on startup, then seed ensemble scorer from canister
+  initCanisterActor().then(() => {
+    // NEW-H6: seed ensemble scorer from resolved signals already in the buffer
+    // If resolved signals were restored from disk, init immediately — no cold start
+    if (resolvedSignalsBuffer.length >= 100) {
+      console.log(`[Ensemble] Seeding from ${resolvedSignalsBuffer.length} restored resolved signals...`);
+      ensembleScorer.initEnsembleScorer(resolvedSignalsBuffer);
+    } else {
+      console.log('[Ensemble] Insufficient resolved signals on startup (' + resolvedSignalsBuffer.length + '). Model will activate once 100+ outcomes are available.');
+    }
+  }).catch(err => console.error('[canister] Actor init error:', err.message));
 
   // H1 — retrain ensemble model daily
   setInterval(() => {
     try { ensembleScorer.retrainIfNeeded(resolvedSignalsBuffer); }
     catch (e) { console.error('[ensemble] Retrain interval error:', e.message); }
   }, 24 * 60 * 60 * 1000);
-
-  // Ensemble scorer — canister startup fetch disabled (no resolved signals yet)
 });
