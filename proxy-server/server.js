@@ -57,11 +57,12 @@ const DUKASCOPY_INSTRUMENTS = {
 // ---------------------------------------------------------------------------
 // File paths — ALL use /data (Railway persistent volume)
 // ---------------------------------------------------------------------------
-const CANDLE_STORE_PATH         = '/data/candle-store.json';
-const BACKFILL_PROGRESS_PATH    = '/data/backfill-progress.json';
-const INTELLIGENCE_PROFILE_PATH = '/data/intelligence-profile.json';
-const PAPER_SIGNALS_PATH        = '/data/paper-signals.json';   // M1
-const RESOLVED_SIGNALS_PATH     = '/data/resolved-signals.json'; // M2
+const DATA_DIR                  = process.env.DATA_DIR || '/data';
+const CANDLE_STORE_PATH         = `${DATA_DIR}/candle-store.json`;
+const BACKFILL_PROGRESS_PATH    = `${DATA_DIR}/backfill-progress.json`;
+const INTELLIGENCE_PROFILE_PATH = `${DATA_DIR}/intelligence-profile.json`;
+const PAPER_SIGNALS_PATH        = `${DATA_DIR}/paper-signals.json`;   // M1
+const RESOLVED_SIGNALS_PATH     = `${DATA_DIR}/resolved-signals.json`; // M2
 
 // ---------------------------------------------------------------------------
 // In-memory state
