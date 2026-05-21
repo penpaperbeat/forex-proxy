@@ -559,6 +559,94 @@ function getDXYCache() {
 }
 
 // ---------------------------------------------------------------------------
+// PART 5 — HIGHER TIMEFRAME CONFLUENCE
+// ---------------------------------------------------------------------------
+
+/**
+ * getHTFBias(candles)
+ * Takes H1 candles (oldest-first) and synthesizes H4 and Daily candles to
+ * determine higher-timeframe trend bias via EMA(20)/EMA(50) crossover.
+ * Returns { h4Bias: 'BUY'|'SELL'|'NEUTRAL', dailyBias: 'BUY'|'SELL'|'NEUTRAL' }
+ */
+function getHTFBias(candles) {
+  const neutral = { h4Bias: 'NEUTRAL', dailyBias: 'NEUTRAL' };
+  try {
+    if (!candles || candles.length < 200) return neutral;
+
+    // Synthesize H4 candles — each group of 4 consecutive H1 candles
+    const h4Candles = [];
+    const h4GroupSize = 4;
+    const h4Complete = Math.floor(candles.length / h4GroupSize);
+    for (let i = 0; i < h4Complete; i++) {
+      const group = candles.slice(i * h4GroupSize, i * h4GroupSize + h4GroupSize);
+      h4Candles.push({ close: group[group.length - 1].close });
+    }
+
+    // Synthesize Daily candles — each group of 24 consecutive H1 candles
+    const dailyCandles = [];
+    const dailyGroupSize = 24;
+    const dailyComplete = Math.floor(candles.length / dailyGroupSize);
+    for (let i = 0; i < dailyComplete; i++) {
+      const group = candles.slice(i * dailyGroupSize, i * dailyGroupSize + dailyGroupSize);
+      dailyCandles.push({ close: group[group.length - 1].close });
+    }
+
+    // Compute H4 bias
+    let h4Bias = 'NEUTRAL';
+    if (h4Candles.length >= 50) {
+      const h4Closes = h4Candles.map(c => c.close);
+      const h4Ema20  = calculateEMA(h4Closes, 20);
+      const h4Ema50  = calculateEMA(h4Closes, 50);
+      if (h4Ema20 !== null && h4Ema50 !== null) {
+        if      (h4Ema20 > h4Ema50) h4Bias = 'BUY';
+        else if (h4Ema20 < h4Ema50) h4Bias = 'SELL';
+      }
+    }
+
+    // Compute Daily bias
+    let dailyBias = 'NEUTRAL';
+    if (dailyCandles.length >= 50) {
+      const dailyCloses = dailyCandles.map(c => c.close);
+      const dailyEma20  = calculateEMA(dailyCloses, 20);
+      const dailyEma50  = calculateEMA(dailyCloses, 50);
+      if (dailyEma20 !== null && dailyEma50 !== null) {
+        if      (dailyEma20 > dailyEma50) dailyBias = 'BUY';
+        else if (dailyEma20 < dailyEma50) dailyBias = 'SELL';
+      }
+    }
+
+    return { h4Bias, dailyBias };
+
+  } catch (err) {
+    console.error('[SMC] getHTFBias error:', err.message);
+    return neutral;
+  }
+}
+
+/**
+ * htfConflictCheck(direction, htfBias)
+ * Returns true if EITHER h4Bias OR dailyBias directly opposes the signal direction.
+ * NEUTRAL on either timeframe does NOT count as a conflict.
+ * direction: 'BUY' | 'SELL'
+ * htfBias: { h4Bias: string, dailyBias: string }
+ */
+function htfConflictCheck(direction, htfBias) {
+  try {
+    if (!htfBias) return false;
+    if (direction === 'BUY') {
+      return htfBias.h4Bias === 'SELL' || htfBias.dailyBias === 'SELL';
+    }
+    if (direction === 'SELL') {
+      return htfBias.h4Bias === 'BUY' || htfBias.dailyBias === 'BUY';
+    }
+    return false;
+  } catch (err) {
+    console.error('[SMC] htfConflictCheck error:', err.message);
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Exports
 // ---------------------------------------------------------------------------
 module.exports = {
@@ -573,5 +661,7 @@ module.exports = {
   getDXYPenalty,
   computeSignalTypeKey,
   classifySignal,
-  getDXYCache
+  getDXYCache,
+  getHTFBias,
+  htfConflictCheck
 };
