@@ -6,7 +6,7 @@
  * Uses worker_threads (Node.js built-in — no npm install required).
  *
  * Public API:
- *   initEnsembleScorer(resolvedSignals)            — train if >= 100 samples
+ *   initEnsembleScorer(resolvedSignals)            — train if >= 40 samples
  *   scoreSignal(features)                          — Promise<number> 0-100 (null = untrained)
  *   retrainIfNeeded(resolvedSignals)               — retrain if 7 days elapsed or 50+ new signals
  *   extractFeatures(signal, paperTypeStats, sweepAge) — returns 13-element number[]
@@ -191,8 +191,8 @@ function extractFeatures(signal, paperTypeStats, sweepAge) {
 
 function initEnsembleScorer(resolvedSignals) {
   const count = (resolvedSignals || []).length;
-  if (count < 100) {
-    console.log(`[Ensemble] Insufficient resolved signals on startup (${count}). Model will activate once 100+ outcomes are available.`);
+  if (count < 40) {
+    console.log(`[Ensemble] Insufficient resolved signals on startup (${count}). Model will activate once 40+ outcomes are available.`);
     return;
   }
 
@@ -228,7 +228,7 @@ function scoreSignal(features) {
 }
 
 function retrainIfNeeded(resolvedSignals) {
-  if (!resolvedSignals || resolvedSignals.length < 100) return;
+  if (!resolvedSignals || resolvedSignals.length < 40) return;
 
   newResolvedSinceTrain++;
 
@@ -250,7 +250,7 @@ function retrainIfNeeded(resolvedSignals) {
 function getEnsembleStatus() {
   const nextRetrainAt = state.modelTrained && state.lastTrainedAt
     ? new Date(new Date(state.lastTrainedAt).getTime() + 7 * 24 * 60 * 60 * 1000).toISOString()
-    : 'Pending minimum samples (need 100 resolved signals)';
+    : 'Pending minimum samples (need 40 resolved signals)';
   return {
     modelTrained:          state.modelTrained,
     lastTrainedAt:         state.lastTrainedAt,
@@ -262,10 +262,46 @@ function getEnsembleStatus() {
   };
 }
 
+/**
+ * computeSoftLabel(signal, currentPrice)
+ * Returns a soft outcome label 0.0–1.0 based on how far price has moved
+ * from entry toward TP (1.0) or SL (0.0). Returns 0.5 on missing data.
+ */
+function computeSoftLabel(signal, currentPrice) {
+  try {
+    const tp    = signal.takeProfit1 ?? signal.takeProfit ?? null;
+    const sl    = signal.stopLoss    ?? null;
+    const entry = signal.entryPrice  ?? null;
+    const dir   = signal.direction;
+
+    if (tp === null || sl === null || entry === null || dir === undefined) return 0.5;
+
+    if (dir === 'BUY') {
+      if (currentPrice >= tp) return 1.0;
+      if (currentPrice <= sl) return 0.0;
+      if (tp === entry) return 0.5;
+      return Math.max(0.0, Math.min(1.0, (currentPrice - entry) / (tp - entry)));
+    }
+
+    if (dir === 'SELL') {
+      if (currentPrice <= tp) return 1.0;
+      if (currentPrice >= sl) return 0.0;
+      if (entry === sl) return 0.5;
+      return Math.max(0.0, Math.min(1.0, (entry - currentPrice) / (entry - sl)));
+    }
+
+    return 0.5;
+  } catch (err) {
+    console.error('[Ensemble] computeSoftLabel error:', err.message);
+    return 0.5;
+  }
+}
+
 module.exports = {
   initEnsembleScorer,
   scoreSignal,
   retrainIfNeeded,
   extractFeatures,
-  getEnsembleStatus
+  getEnsembleStatus,
+  computeSoftLabel
 };
